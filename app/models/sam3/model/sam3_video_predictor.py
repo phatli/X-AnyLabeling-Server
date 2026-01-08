@@ -252,6 +252,10 @@ class Sam3VideoPredictor:
         else:
             del session
             gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                if hasattr(torch.cuda, "ipc_collect"):
+                    torch.cuda.ipc_collect()
             logger.info(
                 f"removed session {session_id}; {self._get_session_stats()}"
             )
@@ -292,6 +296,11 @@ class Sam3VideoPredictor:
     def shutdown(self):
         """Shutdown the predictor and clear all sessions."""
         self._ALL_INFERENCE_STATES.clear()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            if hasattr(torch.cuda, "ipc_collect"):
+                torch.cuda.ipc_collect()
 
 
 class Sam3VideoPredictorMultiGPU(Sam3VideoPredictor):

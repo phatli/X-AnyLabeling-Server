@@ -1,4 +1,5 @@
 import cv2
+import math
 import os
 import shutil
 import sys
@@ -55,6 +56,7 @@ class _VideoSession:
         self.last_prompt_frame: Optional[int] = None
         self.prompt_frame_outputs: Optional[Dict[str, Any]] = None
         self.prompt_frame_params: Optional[Dict[str, Any]] = None
+        self.rotation_cache: Dict[int, Dict[str, Any]] = {}
         self.created_at = time.time()
         self.temp_dir: Optional[str] = None
         self._init_predictor_session()
@@ -287,6 +289,12 @@ class SegmentAnything3Video(BaseModel):
                 session_id=session_id,
             )
         )
+        session.rotation_cache.clear()
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            if hasattr(torch.cuda, "ipc_collect"):
+                torch.cuda.ipc_collect()
 
         response = session.predictor.handle_request(
             request=dict(
@@ -333,9 +341,14 @@ class SegmentAnything3Video(BaseModel):
             inference_params["conf_threshold"],
             inference_params["show_boxes"],
             inference_params["show_masks"],
+            inference_params["show_rotations"],
+            inference_params["rotation_smooth"],
+            inference_params["rotation_min_area"],
+            inference_params["rotation_max_delta"],
             inference_params["epsilon_factor"],
             orig_width,
             orig_height,
+            session.rotation_cache,
         )
 
         return {
@@ -403,6 +416,11 @@ class SegmentAnything3Video(BaseModel):
                 f"Could not initialize cache for frame {relative_frame_index}: {e}"
             )
 
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            if hasattr(torch.cuda, "ipc_collect"):
+                torch.cuda.ipc_collect()
+
         response = session.predictor.handle_request(
             request=dict(
                 type="add_prompt",
@@ -438,7 +456,6 @@ class SegmentAnything3Video(BaseModel):
             obj_id_to_mask = {}
 
             if len(out_obj_ids) > 0:
-                import torch
                 import torch.nn.functional as F
 
                 H_video = inference_state.get(
@@ -515,9 +532,14 @@ class SegmentAnything3Video(BaseModel):
             inference_params["conf_threshold"],
             inference_params["show_boxes"],
             inference_params["show_masks"],
+            inference_params["show_rotations"],
+            inference_params["rotation_smooth"],
+            inference_params["rotation_min_area"],
+            inference_params["rotation_max_delta"],
             inference_params["epsilon_factor"],
             orig_width,
             orig_height,
+            session.rotation_cache,
         )
 
         return {
@@ -771,9 +793,14 @@ class SegmentAnything3Video(BaseModel):
                     params["conf_threshold"],
                     params["show_boxes"],
                     params["show_masks"],
+                    params["show_rotations"],
+                    params["rotation_smooth"],
+                    params["rotation_min_area"],
+                    params["rotation_max_delta"],
                     params["epsilon_factor"],
                     orig_width,
                     orig_height,
+                    session.rotation_cache,
                 )
 
                 results[absolute_frame_idx] = {"masks": shapes}
@@ -799,9 +826,14 @@ class SegmentAnything3Video(BaseModel):
                     params["conf_threshold"],
                     params["show_boxes"],
                     params["show_masks"],
+                    params["show_rotations"],
+                    params["rotation_smooth"],
+                    params["rotation_min_area"],
+                    params["rotation_max_delta"],
                     params["epsilon_factor"],
                     orig_width,
                     orig_height,
+                    session.rotation_cache,
                 )
                 results[prompt_absolute_idx] = {"masks": prompt_shapes}
 
@@ -1052,9 +1084,14 @@ class SegmentAnything3Video(BaseModel):
                 params["conf_threshold"],
                 params["show_boxes"],
                 params["show_masks"],
+                params["show_rotations"],
+                params["rotation_smooth"],
+                params["rotation_min_area"],
+                params["rotation_max_delta"],
                 params["epsilon_factor"],
                 orig_width,
                 orig_height,
+                session.rotation_cache if session else None,
             )
 
             results[absolute_frame_idx] = {"masks": shapes}
@@ -1079,9 +1116,14 @@ class SegmentAnything3Video(BaseModel):
                 params["conf_threshold"],
                 params["show_boxes"],
                 params["show_masks"],
+                params["show_rotations"],
+                params["rotation_smooth"],
+                params["rotation_min_area"],
+                params["rotation_max_delta"],
                 params["epsilon_factor"],
                 orig_width,
                 orig_height,
+                session.rotation_cache if session else None,
             )
             results[prompt_absolute_idx] = {"masks": prompt_shapes}
 
@@ -1099,15 +1141,54 @@ class SegmentAnything3Video(BaseModel):
             Dictionary with conf_threshold, show_boxes, show_masks, epsilon_factor.
         """
         params = prompt_params or {}
+        output_mode = (
+            str(
+                params.get(
+                    "output_mode", self.params.get("output_mode", "")
+                )
+            )
+            .strip()
+            .lower()
+        )
+        show_boxes = params.get(
+            "show_boxes", self.params.get("show_boxes", True)
+        )
+        show_masks = params.get(
+            "show_masks", self.params.get("show_masks", False)
+        )
+        show_rotations = params.get(
+            "show_rotations", self.params.get("show_rotations", False)
+        )
+        if output_mode:
+            if output_mode in {"polygon", "mask", "seg"}:
+                show_boxes = False
+                show_masks = True
+                show_rotations = False
+            elif output_mode in {"obb", "rotation"}:
+                show_boxes = False
+                show_masks = False
+                show_rotations = True
+            elif output_mode in {"hbb", "rectangle", "box"}:
+                show_boxes = True
+                show_masks = False
+                show_rotations = False
+
         return {
             "conf_threshold": params.get(
                 "conf_threshold", self.params.get("conf_threshold", 0.25)
             ),
-            "show_boxes": params.get(
-                "show_boxes", self.params.get("show_boxes", True)
+            "show_boxes": show_boxes,
+            "show_masks": show_masks,
+            "show_rotations": show_rotations,
+            "rotation_smooth": params.get(
+                "rotation_smooth", self.params.get("rotation_smooth", 0.6)
             ),
-            "show_masks": params.get(
-                "show_masks", self.params.get("show_masks", False)
+            "rotation_min_area": params.get(
+                "rotation_min_area", self.params.get("rotation_min_area", 10.0)
+            ),
+            "rotation_max_delta": params.get(
+                "rotation_max_delta",
+                self.params.get("rotation_max_delta", 0.523599),
             ),
             "epsilon_factor": params.get(
                 "epsilon_factor", self.params.get("epsilon_factor", 0.001)
@@ -1155,9 +1236,14 @@ class SegmentAnything3Video(BaseModel):
         conf_threshold: float,
         show_boxes: bool,
         show_masks: bool,
+        show_rotations: bool,
+        rotation_smooth: float,
+        rotation_min_area: float,
+        rotation_max_delta: float,
         epsilon_factor: float,
         orig_width: int,
         orig_height: int,
+        rotation_cache: Optional[Dict[int, Dict[str, Any]]] = None,
     ) -> List[Dict[str, Any]]:
         """Convert SAM3 video outputs to shape dictionaries.
 
@@ -1238,6 +1324,37 @@ class SegmentAnything3Video(BaseModel):
                         }
                     )
 
+            if show_rotations:
+                rotation_data = self._mask_to_rotation(
+                    mask_np, rotation_min_area
+                )
+                if rotation_data:
+                    rotation_key = group_id if group_id is not None else i
+                    if rotation_cache is not None:
+                        prev = rotation_cache.get(rotation_key)
+                        if prev:
+                            rotation_data = self._smooth_rotation(
+                                prev,
+                                rotation_data,
+                                rotation_smooth,
+                                rotation_max_delta,
+                            )
+                        rotation_cache[rotation_key] = rotation_data
+
+                    box = rotation_data["box"]
+                    shapes.append(
+                        {
+                            "label": label,
+                            "shape_type": "rotation",
+                            "points": [
+                                [float(x), float(y)] for x, y in box
+                            ],
+                            "score": score,
+                            "group_id": group_id,
+                            "direction": rotation_data["angle"],
+                        }
+                    )
+
             if show_boxes:
                 try:
                     box_xywh = out_boxes_xywh[i]
@@ -1303,3 +1420,87 @@ class SegmentAnything3Video(BaseModel):
             points.append(points[0])
 
         return points
+
+    def _mask_to_rotation(
+        self, mask: np.ndarray, min_area: float = 10.0
+    ) -> Optional[Dict[str, Any]]:
+        mask_uint8 = (mask > 0.5).astype(np.uint8)
+        contours, _ = cv2.findContours(
+            mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        if not contours:
+            return None
+
+        largest_contour = max(contours, key=cv2.contourArea)
+        area = float(cv2.contourArea(largest_contour))
+        if min_area > 0 and area < min_area:
+            return None
+
+        rect = cv2.minAreaRect(largest_contour)
+        (cx, cy), (w, h), angle_deg = rect
+        if w <= 0 or h <= 0:
+            return None
+        if w < h:
+            w, h = h, w
+            angle_deg += 90.0
+
+        angle_rad = math.radians(angle_deg) % math.pi
+        box = cv2.boxPoints(((cx, cy), (w, h), angle_deg))
+        return {
+            "center": (float(cx), float(cy)),
+            "size": (float(w), float(h)),
+            "angle": float(angle_rad),
+            "box": box,
+        }
+
+    def _smooth_rotation(
+        self,
+        prev: Dict[str, Any],
+        curr: Dict[str, Any],
+        alpha: float,
+        max_delta: float,
+    ) -> Dict[str, Any]:
+        px, py = prev["center"]
+        cx, cy = curr["center"]
+        pw, ph = prev["size"]
+        cw, ch = curr["size"]
+        pa = float(prev["angle"]) % math.pi
+        ca = float(curr["angle"]) % math.pi
+
+        max_delta_val = float(max_delta) if max_delta is not None else 0.0
+        if max_delta_val > math.pi:
+            max_delta_val = math.radians(max_delta_val)
+        if max_delta_val > 0:
+            max_delta_val = min(max_delta_val, math.pi / 2)
+            delta = ((ca - pa + math.pi / 2) % math.pi) - math.pi / 2
+            if abs(delta) > max_delta_val:
+                ca = (pa + math.copysign(max_delta_val, delta)) % math.pi
+
+        if alpha <= 0 or alpha >= 1:
+            angle = ca
+            nx, ny = cx, cy
+            nw, nh = cw, ch
+        else:
+            sin_val = (1 - alpha) * math.sin(2 * pa) + alpha * math.sin(
+                2 * ca
+            )
+            cos_val = (1 - alpha) * math.cos(2 * pa) + alpha * math.cos(
+                2 * ca
+            )
+            angle = 0.5 * math.atan2(sin_val, cos_val)
+            if angle < 0:
+                angle += math.pi
+
+            nx = (1 - alpha) * px + alpha * cx
+            ny = (1 - alpha) * py + alpha * cy
+            nw = (1 - alpha) * pw + alpha * cw
+            nh = (1 - alpha) * ph + alpha * ch
+
+        angle_deg = math.degrees(angle)
+        box = cv2.boxPoints(((nx, ny), (nw, nh), angle_deg))
+        return {
+            "center": (float(nx), float(ny)),
+            "size": (float(nw), float(nh)),
+            "angle": float(angle),
+            "box": box,
+        }
