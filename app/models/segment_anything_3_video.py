@@ -1,4 +1,5 @@
 import cv2
+import gc
 import math
 import os
 import shutil
@@ -38,6 +39,7 @@ class _VideoSession:
         frames: List[np.ndarray],
         start_frame_index: int,
         predictor: Any,
+        offload_video_to_cpu: bool = False,
     ):
         """Initialize video session.
 
@@ -51,12 +53,16 @@ class _VideoSession:
         self.frames = frames
         self.start_frame_index = start_frame_index
         self.predictor = predictor
+        self.offload_video_to_cpu = offload_video_to_cpu
         self.text_prompt: Optional[str] = None
         self.is_point_prompt: bool = False
         self.last_prompt_frame: Optional[int] = None
         self.prompt_frame_outputs: Optional[Dict[str, Any]] = None
         self.prompt_frame_params: Optional[Dict[str, Any]] = None
         self.rotation_cache: Dict[int, Dict[str, Any]] = {}
+        self.low_conf_frames: Dict[int, int] = {}
+        self.suppressed_obj_ids: set[int] = set()
+        self.mask_cache: Dict[int, np.ndarray] = {}
         self.created_at = time.time()
         self.temp_dir: Optional[str] = None
         self._init_predictor_session()
@@ -76,6 +82,7 @@ class _VideoSession:
                 type="start_session",
                 resource_path=frame_dir,
                 session_id=self.session_id,
+                offload_video_to_cpu=self.offload_video_to_cpu,
             )
         )
         logger.info(
@@ -156,9 +163,70 @@ class SegmentAnything3Video(BaseModel):
         self._tasks: Dict[str, _PropagationTask] = {}
         self._sessions_lock = threading.Lock()
         self._tasks_lock = threading.Lock()
-        self._executor = ThreadPoolExecutor(max_workers=2)
-        self._max_sessions = 10
+        self._executor = ThreadPoolExecutor(max_workers=1)
+        self._max_sessions = self._parse_int(
+            self.params.get(
+                "max_sessions", os.getenv("SAM3_MAX_SESSIONS", "1")
+            ),
+            1,
+        )
+        if self._max_sessions < 1:
+            self._max_sessions = 1
         self._session_timeout = 1800
+        self._propagate_chunk_size = self._parse_int(
+            self.params.get(
+                "propagate_chunk_size",
+                os.getenv("SAM3_PROPAGATE_CHUNK_SIZE", "0"),
+            ),
+            0,
+        )
+        if self._propagate_chunk_size < 0:
+            self._propagate_chunk_size = 0
+        self._offload_video_to_cpu = self._parse_bool(
+            self.params.get(
+                "offload_video_to_cpu",
+                os.getenv("SAM3_OFFLOAD_VIDEO_TO_CPU", "false"),
+            )
+        )
+        self._async_loading_frames = self._parse_bool(
+            self.params.get(
+                "async_loading_frames",
+                os.getenv("SAM3_ASYNC_LOADING_FRAMES", "true"),
+            )
+        )
+        self._clear_cache_interval = self._parse_int(
+            self.params.get(
+                "clear_cache_interval",
+                os.getenv("SAM3_CLEAR_CACHE_INTERVAL", "0"),
+            ),
+            0,
+        )
+        if self._clear_cache_interval < 0:
+            self._clear_cache_interval = 0
+        self._video_loader_type = str(
+            self.params.get(
+                "video_loader_type",
+                os.getenv("SAM3_VIDEO_LOADER_TYPE", "cv2"),
+            )
+        ).strip().lower()
+        if self._video_loader_type not in {"cv2", "torchcodec"}:
+            logger.warning(
+                f"Invalid SAM3 video_loader_type '{self._video_loader_type}', fallback to 'cv2'"
+            )
+            self._video_loader_type = "cv2"
+
+    @staticmethod
+    def _parse_int(value: Any, default: int) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _parse_bool(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in {"1", "true", "y", "yes"}
 
     def load(self):
         """Load SAM3 video model and initialize components."""
@@ -186,10 +254,49 @@ class SegmentAnything3Video(BaseModel):
         logger.info(
             f"Loading SAM3 video model from {model_path} on devices {gpus_to_use}"
         )
+        apply_temporal_disambiguation = self._parse_bool(
+            self.params.get("sam3_apply_temporal_disambiguation", True)
+        )
+        stability_thresh = self.params.get(
+            "sam3_dynamic_multimask_stability_thresh", None
+        )
+        try:
+            stability_thresh = (
+                float(stability_thresh)
+                if stability_thresh is not None
+                else None
+            )
+        except (TypeError, ValueError):
+            stability_thresh = None
+        stability_delta = self.params.get(
+            "sam3_dynamic_multimask_stability_delta", None
+        )
+        try:
+            stability_delta = (
+                float(stability_delta)
+                if stability_delta is not None
+                else None
+            )
+        except (TypeError, ValueError):
+            stability_delta = None
+        mf_threshold = self.params.get("sam3_mf_threshold", None)
+        try:
+            mf_threshold = (
+                float(mf_threshold) if mf_threshold is not None else None
+            )
+        except (TypeError, ValueError):
+            mf_threshold = None
+
         self.predictor = build_sam3_video_predictor(
             gpus_to_use=gpus_to_use,
             bpe_path=bpe_path,
             checkpoint_path=model_path,
+            async_loading_frames=self._async_loading_frames,
+            video_loader_type=self._video_loader_type,
+            apply_temporal_disambiguation=apply_temporal_disambiguation,
+            dynamic_multimask_stability_thresh=stability_thresh,
+            dynamic_multimask_stability_delta=stability_delta,
+            mf_threshold=mf_threshold,
         )
 
         logger.info("SAM3 video model loaded successfully")
@@ -245,7 +352,11 @@ class SegmentAnything3Video(BaseModel):
                 self._sessions[session_id].cleanup()
 
             session = _VideoSession(
-                session_id, frames, start_frame_index, self.predictor
+                session_id,
+                frames,
+                start_frame_index,
+                self.predictor,
+                offload_video_to_cpu=self._offload_video_to_cpu,
             )
             self._sessions[session_id] = session
 
@@ -277,6 +388,18 @@ class SegmentAnything3Video(BaseModel):
         if not session:
             return {"error": f"Session {session_id} not found"}
 
+        if params.get("reset_tracker"):
+            session.predictor.handle_request(
+                request=dict(type="reset_session", session_id=session_id)
+            )
+            session.rotation_cache.clear()
+            session.low_conf_frames.clear()
+            session.suppressed_obj_ids.clear()
+            session.mask_cache.clear()
+            session.prompt_frame_outputs = None
+            session.prompt_frame_params = None
+            session.text_prompt = None
+
         relative_frame_index = frame_index - session.start_frame_index
         if relative_frame_index < 0 or relative_frame_index >= len(
             session.frames
@@ -290,6 +413,9 @@ class SegmentAnything3Video(BaseModel):
             )
         )
         session.rotation_cache.clear()
+        session.low_conf_frames.clear()
+        session.suppressed_obj_ids.clear()
+        session.mask_cache.clear()
 
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -314,6 +440,7 @@ class SegmentAnything3Video(BaseModel):
         out_probs = outputs.get("out_probs", [])
         out_obj_ids = self._normalize_obj_ids(outputs.get("out_obj_ids", []))
         out_boxes_xywh = outputs.get("out_boxes_xywh", [])
+        out_tracker_probs = outputs.get("out_tracker_probs", None)
 
         if len(out_binary_masks) == 0:
             logger.warning("No masks returned from video prompt")
@@ -326,6 +453,7 @@ class SegmentAnything3Video(BaseModel):
             "out_probs": out_probs,
             "out_obj_ids": out_obj_ids,
             "out_boxes_xywh": out_boxes_xywh,
+            "out_tracker_probs": out_tracker_probs,
         }
         session.prompt_frame_params = params.copy()
 
@@ -337,18 +465,28 @@ class SegmentAnything3Video(BaseModel):
             out_probs,
             out_obj_ids,
             out_boxes_xywh,
+            out_tracker_probs,
             text_prompt,
             inference_params["conf_threshold"],
+            inference_params["tracker_conf_threshold"],
+            inference_params["mask_min_area_ratio"],
+            inference_params["mask_expand_ratio"],
+            inference_params["mask_union_iou"],
+            inference_params["mask_union_max_area_ratio"],
+            inference_params["use_mask_bbox"],
             inference_params["show_boxes"],
             inference_params["show_masks"],
             inference_params["show_rotations"],
             inference_params["rotation_smooth"],
             inference_params["rotation_min_area"],
             inference_params["rotation_max_delta"],
+            inference_params["rotation_lock_area_ratio"],
             inference_params["epsilon_factor"],
             orig_width,
             orig_height,
+            session.suppressed_obj_ids,
             session.rotation_cache,
+            session.mask_cache,
         )
 
         return {
@@ -398,6 +536,21 @@ class SegmentAnything3Video(BaseModel):
         if obj_id is None:
             obj_id = 99999
 
+        if params.get("reset_tracker"):
+            session.predictor.handle_request(
+                request=dict(type="reset_session", session_id=session_id)
+            )
+            session.rotation_cache.clear()
+            session.low_conf_frames.clear()
+            session.suppressed_obj_ids.clear()
+            session.mask_cache.clear()
+            session.prompt_frame_outputs = None
+            session.prompt_frame_params = None
+            session.text_prompt = None
+
+        session.low_conf_frames.clear()
+        session.suppressed_obj_ids.clear()
+
         try:
             predictor_session = session.predictor._get_session(session_id)
             inference_state = predictor_session["state"]
@@ -441,6 +594,7 @@ class SegmentAnything3Video(BaseModel):
         out_probs = outputs.get("out_probs", [])
         out_obj_ids = self._normalize_obj_ids(outputs.get("out_obj_ids", []))
         out_boxes_xywh = outputs.get("out_boxes_xywh", [])
+        out_tracker_probs = outputs.get("out_tracker_probs", None)
 
         if len(out_binary_masks) == 0:
             logger.warning("No masks returned from video point prompt")
@@ -452,7 +606,6 @@ class SegmentAnything3Video(BaseModel):
             if "cached_frame_outputs" not in inference_state:
                 inference_state["cached_frame_outputs"] = {}
 
-            num_frames = len(session.frames)
             obj_id_to_mask = {}
 
             if len(out_obj_ids) > 0:
@@ -498,15 +651,10 @@ class SegmentAnything3Video(BaseModel):
                             mask_bool = mask_bool.to(torch.bool)
                         obj_id_to_mask[obj_id_int] = mask_bool
 
-            for fidx in range(num_frames):
-                if fidx not in inference_state["cached_frame_outputs"]:
-                    inference_state["cached_frame_outputs"][
-                        fidx
-                    ] = obj_id_to_mask.copy()
-                else:
-                    inference_state["cached_frame_outputs"][fidx].update(
-                        obj_id_to_mask
-                    )
+            frame_cache = inference_state["cached_frame_outputs"].setdefault(
+                relative_frame_index, {}
+            )
+            frame_cache.update(obj_id_to_mask)
         except (AttributeError, RuntimeError, KeyError, Exception) as e:
             logger.warning(f"Could not initialize cache for all frames: {e}")
 
@@ -517,6 +665,7 @@ class SegmentAnything3Video(BaseModel):
             "out_probs": out_probs,
             "out_obj_ids": out_obj_ids,
             "out_boxes_xywh": out_boxes_xywh,
+            "out_tracker_probs": out_tracker_probs,
         }
         session.prompt_frame_params = params.copy()
 
@@ -528,18 +677,28 @@ class SegmentAnything3Video(BaseModel):
             out_probs,
             out_obj_ids,
             out_boxes_xywh,
+            out_tracker_probs,
             "AUTOLABEL_OBJECT",
             inference_params["conf_threshold"],
+            inference_params["tracker_conf_threshold"],
+            inference_params["mask_min_area_ratio"],
+            inference_params["mask_expand_ratio"],
+            inference_params["mask_union_iou"],
+            inference_params["mask_union_max_area_ratio"],
+            inference_params["use_mask_bbox"],
             inference_params["show_boxes"],
             inference_params["show_masks"],
             inference_params["show_rotations"],
             inference_params["rotation_smooth"],
             inference_params["rotation_min_area"],
             inference_params["rotation_max_delta"],
+            inference_params["rotation_lock_area_ratio"],
             inference_params["epsilon_factor"],
             orig_width,
             orig_height,
+            session.suppressed_obj_ids,
             session.rotation_cache,
+            session.mask_cache,
         )
 
         return {
@@ -596,9 +755,8 @@ class SegmentAnything3Video(BaseModel):
                 try:
                     fut.result()
                 except Exception as e:
-                    logger.error(
-                        f"Propagation task {task_id} raised exception: {e}",
-                        exc_info=True,
+                    logger.opt(exception=True).error(
+                        f"Propagation task {task_id} raised exception: {e}"
                     )
 
             future.add_done_callback(log_exception)
@@ -715,16 +873,6 @@ class SegmentAnything3Video(BaseModel):
             "start_frame_index": start_frame_offset,
         }
 
-        request_dict = dict(
-            type="propagate_in_video",
-            session_id=session_id,
-            propagation_direction="forward",
-        )
-        if rel_start is not None:
-            request_dict["start_frame_index"] = rel_start
-        if rel_end is not None:
-            request_dict["max_frame_num_to_track"] = rel_end
-
         bf16_context = None
         try:
             if torch.cuda.is_available():
@@ -735,10 +883,6 @@ class SegmentAnything3Video(BaseModel):
                 )
                 bf16_context.__enter__()
 
-            generator = session.predictor.handle_stream_request(
-                request=request_dict
-            )
-
             prompt_frame_relative_idx = None
             prompt_absolute_idx = None
             if session.last_prompt_frame is not None:
@@ -747,63 +891,150 @@ class SegmentAnything3Video(BaseModel):
                 )
                 prompt_absolute_idx = session.last_prompt_frame
 
+            start_idx = (
+                rel_start
+                if rel_start is not None
+                else (
+                    prompt_frame_relative_idx
+                    if prompt_frame_relative_idx is not None
+                    else 0
+                )
+            )
+            end_idx = (
+                rel_end
+                if rel_end is not None
+                else max(total_frames - 1, 0)
+            )
+            if total_frames <= 0:
+                yield {
+                    "type": "error",
+                    "message": "No frames available for propagation",
+                }
+                return
+            start_idx = max(0, min(start_idx, total_frames - 1))
+            end_idx = max(0, min(end_idx, total_frames - 1))
+            if end_idx < start_idx:
+                end_idx = start_idx
+
+            chunk_size = self._propagate_chunk_size
+            if session.prompt_frame_params:
+                override = self._parse_int(
+                    session.prompt_frame_params.get(
+                        "propagate_chunk_size", 0
+                    ),
+                    0,
+                )
+                if override > 0:
+                    chunk_size = override
+            if chunk_size < 0:
+                chunk_size = 0
+
             frame_count = 0
             results = {}
 
-            for response in generator:
-                frame_idx = response.get("frame_index")
-                outputs = response.get("outputs")
-
-                if frame_idx is None or outputs is None:
-                    continue
-
-                frame_count += 1
-                absolute_frame_idx = frame_idx + start_frame_offset
-
-                yield {
-                    "type": "progress",
-                    "current_frame": absolute_frame_idx,
-                    "total_frames": total_frames,
-                    "progress": frame_count / total_frames,
-                }
-
-                if (
-                    prompt_frame_relative_idx is not None
-                    and frame_idx == prompt_frame_relative_idx
-                    and session.prompt_frame_outputs is not None
-                ):
-                    continue
-
-                out_binary_masks = outputs.get("out_binary_masks", [])
-                out_probs = outputs.get("out_probs", [])
-                out_obj_ids = self._normalize_obj_ids(
-                    outputs.get("out_obj_ids", [])
+            chunk_start = start_idx
+            while chunk_start <= end_idx:
+                chunk_end = (
+                    end_idx
+                    if chunk_size <= 0
+                    else min(chunk_start + chunk_size - 1, end_idx)
                 )
-                out_boxes_xywh = outputs.get("out_boxes_xywh", [])
-
-                params = self._get_inference_params(
-                    session.prompt_frame_params
-                )
-                shapes = self._convert_outputs_to_shapes(
-                    out_binary_masks,
-                    out_probs,
-                    out_obj_ids,
-                    out_boxes_xywh,
-                    text_prompt,
-                    params["conf_threshold"],
-                    params["show_boxes"],
-                    params["show_masks"],
-                    params["show_rotations"],
-                    params["rotation_smooth"],
-                    params["rotation_min_area"],
-                    params["rotation_max_delta"],
-                    params["epsilon_factor"],
-                    orig_width,
-                    orig_height,
-                    session.rotation_cache,
+                request_dict = dict(
+                    type="propagate_in_video",
+                    session_id=session_id,
+                    propagation_direction="forward",
+                    start_frame_index=chunk_start,
+                    max_frame_num_to_track=max(chunk_end - chunk_start, 0),
                 )
 
-                results[absolute_frame_idx] = {"masks": shapes}
+                generator = session.predictor.handle_stream_request(
+                    request=request_dict
+                )
+
+                for response in generator:
+                    frame_idx = response.get("frame_index")
+                    outputs = response.get("outputs")
+
+                    if frame_idx is None or outputs is None:
+                        continue
+
+                    frame_count += 1
+                    self._maybe_clear_cache(frame_count)
+                    absolute_frame_idx = frame_idx + start_frame_offset
+
+                    yield {
+                        "type": "progress",
+                        "current_frame": absolute_frame_idx,
+                        "total_frames": total_frames,
+                        "progress": frame_count / max(total_frames, 1),
+                    }
+
+                    if (
+                        prompt_frame_relative_idx is not None
+                        and frame_idx == prompt_frame_relative_idx
+                        and session.prompt_frame_outputs is not None
+                    ):
+                        continue
+
+                    out_binary_masks = outputs.get("out_binary_masks", [])
+                    out_probs = outputs.get("out_probs", [])
+                    out_obj_ids = self._normalize_obj_ids(
+                        outputs.get("out_obj_ids", [])
+                    )
+                    out_boxes_xywh = outputs.get("out_boxes_xywh", [])
+                    out_tracker_probs = outputs.get("out_tracker_probs", None)
+
+                    params = self._get_inference_params(
+                        session.prompt_frame_params
+                    )
+                    self._update_suppressed_obj_ids(
+                        session,
+                        out_binary_masks,
+                        out_obj_ids,
+                        out_tracker_probs,
+                        params,
+                        orig_width,
+                        orig_height,
+                    )
+                    shapes = self._convert_outputs_to_shapes(
+                        out_binary_masks,
+                        out_probs,
+                        out_obj_ids,
+                        out_boxes_xywh,
+                        out_tracker_probs,
+                        text_prompt,
+                        params["conf_threshold"],
+                        params["tracker_conf_threshold"],
+                        params["mask_min_area_ratio"],
+                        params["mask_expand_ratio"],
+                        params["mask_union_iou"],
+                        params["mask_union_max_area_ratio"],
+                        params["use_mask_bbox"],
+                        params["show_boxes"],
+                        params["show_masks"],
+                        params["show_rotations"],
+                        params["rotation_smooth"],
+                        params["rotation_min_area"],
+                        params["rotation_max_delta"],
+                        params["rotation_lock_area_ratio"],
+                        params["epsilon_factor"],
+                        orig_width,
+                        orig_height,
+                        session.suppressed_obj_ids,
+                        session.rotation_cache,
+                        session.mask_cache,
+                    )
+
+                    results[absolute_frame_idx] = {"masks": shapes}
+
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    if hasattr(torch.cuda, "ipc_collect"):
+                        torch.cuda.ipc_collect()
+
+                if chunk_end >= end_idx:
+                    break
+                chunk_start = chunk_end + 1
 
             if (
                 session.prompt_frame_outputs is not None
@@ -822,18 +1053,28 @@ class SegmentAnything3Video(BaseModel):
                     prompt_outputs.get("out_probs", []),
                     prompt_obj_ids,
                     prompt_outputs.get("out_boxes_xywh", []),
+                    prompt_outputs.get("out_tracker_probs", None),
                     text_prompt,
                     params["conf_threshold"],
+                    params["tracker_conf_threshold"],
+                    params["mask_min_area_ratio"],
+                    params["mask_expand_ratio"],
+                    params["mask_union_iou"],
+                    params["mask_union_max_area_ratio"],
+                    params["use_mask_bbox"],
                     params["show_boxes"],
                     params["show_masks"],
                     params["show_rotations"],
                     params["rotation_smooth"],
                     params["rotation_min_area"],
                     params["rotation_max_delta"],
+                    params["rotation_lock_area_ratio"],
                     params["epsilon_factor"],
                     orig_width,
                     orig_height,
+                    session.suppressed_obj_ids,
                     session.rotation_cache,
+                    session.mask_cache,
                 )
                 results[prompt_absolute_idx] = {"masks": prompt_shapes}
 
@@ -843,7 +1084,9 @@ class SegmentAnything3Video(BaseModel):
             }
 
         except Exception as e:
-            logger.error(f"Stream propagation error: {e}", exc_info=True)
+            logger.opt(exception=True).error(
+                f"Stream propagation error: {e}"
+            )
             yield {"type": "error", "message": str(e)}
         finally:
             if bf16_context is not None:
@@ -867,6 +1110,44 @@ class SegmentAnything3Video(BaseModel):
                 session.cleanup()
                 return True
             return False
+
+    def cleanup_all(self) -> Dict[str, Any]:
+        """清理所有会话与任务，释放显存/内存缓存。"""
+        cancelled_tasks = 0
+        cleared_sessions = 0
+
+        with self._tasks_lock:
+            for task in self._tasks.values():
+                task.cancel()
+                cancelled_tasks += 1
+            self._tasks.clear()
+
+        with self._sessions_lock:
+            for session in list(self._sessions.values()):
+                try:
+                    session.cleanup()
+                except Exception as e:
+                    logger.warning(f"Session cleanup error: {e}")
+                cleared_sessions += 1
+            self._sessions.clear()
+
+        if hasattr(self, "predictor") and self.predictor:
+            try:
+                if hasattr(self.predictor, "_ALL_INFERENCE_STATES"):
+                    self.predictor._ALL_INFERENCE_STATES.clear()
+            except Exception as e:
+                logger.warning(f"Predictor cleanup error: {e}")
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            if hasattr(torch.cuda, "ipc_collect"):
+                torch.cuda.ipc_collect()
+
+        return {
+            "sessions_cleared": cleared_sessions,
+            "tasks_cancelled": cancelled_tasks,
+        }
 
     def unload(self):
         """Release model resources."""
@@ -997,6 +1278,7 @@ class SegmentAnything3Video(BaseModel):
                 outputs_per_frame[frame_idx] = outputs
 
                 frame_count += 1
+                self._maybe_clear_cache(frame_count)
                 with task.lock:
                     task.current_frame = frame_idx
                     task.progress = (
@@ -1014,8 +1296,8 @@ class SegmentAnything3Video(BaseModel):
                 task.progress = 1.0
 
         except Exception as e:
-            logger.error(
-                f"Propagation task {task.task_id} failed: {e}", exc_info=True
+            logger.opt(exception=True).error(
+                f"Propagation task {task.task_id} failed: {e}"
             )
             with task.lock:
                 task.status = _TaskStatus.FAILED
@@ -1054,7 +1336,8 @@ class SegmentAnything3Video(BaseModel):
             )
             prompt_absolute_idx = session.last_prompt_frame
 
-        for frame_idx, outputs in task.results.items():
+        for frame_idx in sorted(task.results.keys()):
+            outputs = task.results[frame_idx]
             absolute_frame_idx = frame_idx + start_frame_offset
 
             if (
@@ -1071,27 +1354,47 @@ class SegmentAnything3Video(BaseModel):
                 outputs.get("out_obj_ids", [])
             )
             out_boxes_xywh = outputs.get("out_boxes_xywh", [])
+            out_tracker_probs = outputs.get("out_tracker_probs", None)
 
             params = self._get_inference_params(
                 session.prompt_frame_params if session else None
+            )
+            self._update_suppressed_obj_ids(
+                session,
+                out_binary_masks,
+                out_obj_ids,
+                out_tracker_probs,
+                params,
+                orig_width,
+                orig_height,
             )
             shapes = self._convert_outputs_to_shapes(
                 out_binary_masks,
                 out_probs,
                 out_obj_ids,
                 out_boxes_xywh,
+                out_tracker_probs,
                 text_prompt,
                 params["conf_threshold"],
+                params["tracker_conf_threshold"],
+                params["mask_min_area_ratio"],
+                params["mask_expand_ratio"],
+                params["mask_union_iou"],
+                params["mask_union_max_area_ratio"],
+                params["use_mask_bbox"],
                 params["show_boxes"],
                 params["show_masks"],
                 params["show_rotations"],
                 params["rotation_smooth"],
                 params["rotation_min_area"],
                 params["rotation_max_delta"],
+                params["rotation_lock_area_ratio"],
                 params["epsilon_factor"],
                 orig_width,
                 orig_height,
+                session.suppressed_obj_ids if session else None,
                 session.rotation_cache if session else None,
+                session.mask_cache if session else None,
             )
 
             results[absolute_frame_idx] = {"masks": shapes}
@@ -1112,18 +1415,28 @@ class SegmentAnything3Video(BaseModel):
                 prompt_outputs.get("out_probs", []),
                 prompt_obj_ids,
                 prompt_outputs.get("out_boxes_xywh", []),
+                prompt_outputs.get("out_tracker_probs", None),
                 text_prompt,
                 params["conf_threshold"],
+                params["tracker_conf_threshold"],
+                params["mask_min_area_ratio"],
+                params["mask_expand_ratio"],
+                params["mask_union_iou"],
+                params["mask_union_max_area_ratio"],
+                params["use_mask_bbox"],
                 params["show_boxes"],
                 params["show_masks"],
                 params["show_rotations"],
                 params["rotation_smooth"],
                 params["rotation_min_area"],
                 params["rotation_max_delta"],
+                params["rotation_lock_area_ratio"],
                 params["epsilon_factor"],
                 orig_width,
                 orig_height,
+                session.suppressed_obj_ids if session else None,
                 session.rotation_cache if session else None,
+                session.mask_cache if session else None,
             )
             results[prompt_absolute_idx] = {"masks": prompt_shapes}
 
@@ -1177,6 +1490,36 @@ class SegmentAnything3Video(BaseModel):
             "conf_threshold": params.get(
                 "conf_threshold", self.params.get("conf_threshold", 0.25)
             ),
+            "tracker_conf_threshold": params.get(
+                "tracker_conf_threshold",
+                self.params.get("tracker_conf_threshold", 0.0),
+            ),
+            "tracker_drop_frames": params.get(
+                "tracker_drop_frames",
+                self.params.get("tracker_drop_frames", 0),
+            ),
+            "tracker_drop_threshold": params.get(
+                "tracker_drop_threshold",
+                self.params.get("tracker_drop_threshold", None),
+            ),
+            "mask_min_area_ratio": params.get(
+                "mask_min_area_ratio",
+                self.params.get("mask_min_area_ratio", 0.0),
+            ),
+            "mask_expand_ratio": params.get(
+                "mask_expand_ratio",
+                self.params.get("mask_expand_ratio", 0.0),
+            ),
+            "mask_union_iou": params.get(
+                "mask_union_iou", self.params.get("mask_union_iou", 0.0)
+            ),
+            "mask_union_max_area_ratio": params.get(
+                "mask_union_max_area_ratio",
+                self.params.get("mask_union_max_area_ratio", 0.0),
+            ),
+            "use_mask_bbox": params.get(
+                "use_mask_bbox", self.params.get("use_mask_bbox", True)
+            ),
             "show_boxes": show_boxes,
             "show_masks": show_masks,
             "show_rotations": show_rotations,
@@ -1189,6 +1532,10 @@ class SegmentAnything3Video(BaseModel):
             "rotation_max_delta": params.get(
                 "rotation_max_delta",
                 self.params.get("rotation_max_delta", 0.523599),
+            ),
+            "rotation_lock_area_ratio": params.get(
+                "rotation_lock_area_ratio",
+                self.params.get("rotation_lock_area_ratio", 1.2),
             ),
             "epsilon_factor": params.get(
                 "epsilon_factor", self.params.get("epsilon_factor", 0.001)
@@ -1210,6 +1557,17 @@ class SegmentAnything3Video(BaseModel):
             return len(frames[0]), len(frames[0][0])
         return 1080, 1920
 
+    def _maybe_clear_cache(self, frame_count: int) -> None:
+        if self._clear_cache_interval <= 0:
+            return
+        if frame_count % self._clear_cache_interval != 0:
+            return
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            if hasattr(torch.cuda, "ipc_collect"):
+                torch.cuda.ipc_collect()
+
     def _normalize_obj_ids(self, obj_ids: Any) -> np.ndarray:
         """Normalize object IDs to numpy array.
 
@@ -1226,24 +1584,140 @@ class SegmentAnything3Video(BaseModel):
         else:
             return np.array([])
 
+    def _update_suppressed_obj_ids(
+        self,
+        session: Optional[_VideoSession],
+        out_binary_masks: np.ndarray,
+        out_obj_ids: np.ndarray,
+        out_tracker_probs: Optional[np.ndarray],
+        params: Dict[str, Any],
+        orig_width: int,
+        orig_height: int,
+    ) -> None:
+        if session is None:
+            return
+
+        try:
+            drop_frames = int(params.get("tracker_drop_frames", 0))
+        except (TypeError, ValueError):
+            drop_frames = 0
+        if drop_frames <= 0:
+            return
+
+        tracker_threshold = params.get(
+            "tracker_drop_threshold", params.get("tracker_conf_threshold", 0.0)
+        )
+        if tracker_threshold is None:
+            tracker_threshold = params.get("tracker_conf_threshold", 0.0)
+        try:
+            tracker_threshold = max(float(tracker_threshold), 0.0)
+        except (TypeError, ValueError):
+            tracker_threshold = 0.0
+
+        mask_min_area_ratio = params.get("mask_min_area_ratio", 0.0)
+        try:
+            mask_min_area_ratio = max(float(mask_min_area_ratio), 0.0)
+        except (TypeError, ValueError):
+            mask_min_area_ratio = 0.0
+
+        image_area = float(max(orig_width * orig_height, 1))
+        out_obj_ids = self._normalize_obj_ids(out_obj_ids)
+
+        current_obj_ids = set()
+        num_objects = (
+            len(out_binary_masks)
+            if isinstance(out_binary_masks, (list, np.ndarray))
+            else 0
+        )
+        for i in range(num_objects):
+            obj_id = None
+            if i < len(out_obj_ids):
+                try:
+                    obj_id = int(out_obj_ids[i])
+                except (ValueError, TypeError):
+                    obj_id = None
+            if obj_id is None:
+                continue
+
+            current_obj_ids.add(obj_id)
+
+            tracker_prob = None
+            if out_tracker_probs is not None:
+                try:
+                    tracker_prob = float(out_tracker_probs[i])
+                except (IndexError, TypeError, ValueError):
+                    tracker_prob = None
+
+            mask_area_ratio = None
+            try:
+                mask = out_binary_masks[i]
+                if isinstance(mask, np.ndarray):
+                    mask_np = mask.astype(np.float32)
+                else:
+                    mask_np = np.array(mask, dtype=np.float32)
+                mask_area_ratio = float((mask_np > 0.5).sum()) / image_area
+            except Exception:
+                mask_area_ratio = None
+
+            low_conf = False
+            if tracker_prob is not None and tracker_prob < tracker_threshold:
+                low_conf = True
+            if (
+                mask_area_ratio is not None
+                and mask_min_area_ratio > 0
+                and mask_area_ratio < mask_min_area_ratio
+            ):
+                low_conf = True
+
+            if low_conf:
+                session.low_conf_frames[obj_id] = (
+                    session.low_conf_frames.get(obj_id, 0) + 1
+                )
+            else:
+                session.low_conf_frames[obj_id] = 0
+                session.suppressed_obj_ids.discard(obj_id)
+
+            if session.low_conf_frames[obj_id] >= drop_frames:
+                session.suppressed_obj_ids.add(obj_id)
+                session.rotation_cache.pop(obj_id + 1, None)
+
+        missing_obj_ids = set(session.low_conf_frames.keys()) - current_obj_ids
+        for obj_id in missing_obj_ids:
+            session.low_conf_frames[obj_id] = (
+                session.low_conf_frames.get(obj_id, 0) + 1
+            )
+            if session.low_conf_frames[obj_id] >= drop_frames:
+                session.suppressed_obj_ids.add(obj_id)
+                session.rotation_cache.pop(obj_id + 1, None)
+
     def _convert_outputs_to_shapes(
         self,
         out_binary_masks: np.ndarray,
         out_probs: np.ndarray,
         out_obj_ids: np.ndarray,
         out_boxes_xywh: np.ndarray,
+        out_tracker_probs: Optional[np.ndarray],
         text_prompt: str,
         conf_threshold: float,
+        tracker_conf_threshold: float,
+        mask_min_area_ratio: float,
+        mask_expand_ratio: float,
+        mask_union_iou: float,
+        mask_union_max_area_ratio: float,
+        use_mask_bbox: bool,
         show_boxes: bool,
         show_masks: bool,
         show_rotations: bool,
         rotation_smooth: float,
         rotation_min_area: float,
         rotation_max_delta: float,
+        rotation_lock_area_ratio: float,
         epsilon_factor: float,
         orig_width: int,
         orig_height: int,
+        suppressed_obj_ids: Optional[set[int]] = None,
         rotation_cache: Optional[Dict[int, Dict[str, Any]]] = None,
+        mask_cache: Optional[Dict[int, np.ndarray]] = None,
     ) -> List[Dict[str, Any]]:
         """Convert SAM3 video outputs to shape dictionaries.
 
@@ -1254,11 +1728,15 @@ class SegmentAnything3Video(BaseModel):
             out_boxes_xywh: Boxes in normalized xywh format (N, 4).
             text_prompt: Text prompt string.
             conf_threshold: Confidence threshold.
+            tracker_conf_threshold: Tracker confidence threshold.
+            mask_min_area_ratio: Minimum mask area ratio.
+            use_mask_bbox: Whether to use mask-derived HBB.
             show_boxes: Whether to return bounding boxes.
             show_masks: Whether to return masks as polygons.
             epsilon_factor: Factor for polygon approximation.
             orig_width: Original image width.
             orig_height: Original image height.
+            suppressed_obj_ids: Object IDs suppressed due to low confidence.
 
         Returns:
             List of shape dictionaries.
@@ -1282,27 +1760,55 @@ class SegmentAnything3Video(BaseModel):
         if num_objects == 0:
             return shapes
 
+        image_area = float(orig_width * orig_height)
+        if image_area <= 0:
+            image_area = 1.0
+        tracker_conf_threshold = max(float(tracker_conf_threshold), 0.0)
+        mask_min_area_ratio = max(float(mask_min_area_ratio), 0.0)
+        try:
+            mask_expand_ratio = max(float(mask_expand_ratio), 0.0)
+        except (TypeError, ValueError):
+            mask_expand_ratio = 0.0
+        try:
+            mask_union_iou = max(float(mask_union_iou), 0.0)
+        except (TypeError, ValueError):
+            mask_union_iou = 0.0
+        try:
+            mask_union_max_area_ratio = max(
+                float(mask_union_max_area_ratio), 0.0
+            )
+        except (TypeError, ValueError):
+            mask_union_max_area_ratio = 0.0
+
         for i in range(num_objects):
             try:
-                prob = float(out_probs[i])
-                if prob < conf_threshold:
-                    continue
-                score = prob
+                prob_val = float(out_probs[i])
             except (IndexError, TypeError, ValueError):
-                score = 1.0
+                prob_val = 1.0
+
+            tracker_prob = None
+            if out_tracker_probs is not None:
+                try:
+                    tracker_prob = float(out_tracker_probs[i])
+                except (IndexError, TypeError, ValueError):
+                    tracker_prob = None
+
+            if tracker_prob is not None:
+                if tracker_conf_threshold > 0 and tracker_prob < tracker_conf_threshold:
+                    continue
+                prob_val = min(prob_val, tracker_prob)
+
+            if prob_val < conf_threshold:
+                continue
 
             if text_prompt:
                 label = text_prompt
+                score = prob_val
             else:
                 label = "AUTOLABEL_OBJECT"
                 score = None
 
-            mask = out_binary_masks[i]
-            if isinstance(mask, np.ndarray):
-                mask_np = mask.astype(np.float32)
-            else:
-                mask_np = np.array(mask, dtype=np.float32)
-
+            obj_id = None
             group_id = None
             if i < len(out_obj_ids):
                 try:
@@ -1311,8 +1817,80 @@ class SegmentAnything3Video(BaseModel):
                 except (ValueError, TypeError, IndexError):
                     pass
 
+            if (
+                suppressed_obj_ids is not None
+                and obj_id is not None
+                and obj_id in suppressed_obj_ids
+            ):
+                continue
+
+            mask = out_binary_masks[i]
+            if isinstance(mask, np.ndarray):
+                mask_np = mask.astype(np.float32)
+            else:
+                mask_np = np.array(mask, dtype=np.float32)
+            mask_binary = mask_np > 0.5
+
+            mask_binary_box = mask_binary
+            if mask_expand_ratio > 0:
+                mask_binary_box = self._expand_mask(
+                    mask_binary_box, mask_expand_ratio
+                )
+
+            mask_binary_mask = mask_binary_box
+            if (
+                show_masks
+                and mask_union_iou > 0
+                and mask_cache is not None
+                and obj_id is not None
+            ):
+                prev_mask = mask_cache.get(obj_id)
+                if (
+                    prev_mask is not None
+                    and isinstance(prev_mask, np.ndarray)
+                    and prev_mask.shape == mask_binary_box.shape
+                ):
+                    iou = self._mask_iou(mask_binary_box, prev_mask)
+                    if iou >= mask_union_iou:
+                        union = np.logical_or(mask_binary_box, prev_mask)
+                        if mask_union_max_area_ratio > 0:
+                            base_area = float(mask_binary_box.sum())
+                            union_area = float(union.sum())
+                            if (
+                                base_area > 0
+                                and union_area
+                                <= base_area * mask_union_max_area_ratio
+                            ):
+                                mask_binary_mask = union
+                        else:
+                            mask_binary_mask = union
+
+            if mask_min_area_ratio > 0:
+                area_mask = (
+                    mask_binary_mask
+                    if show_masks
+                    else mask_binary_box
+                )
+                mask_area_ratio = float(area_mask.sum()) / image_area
+                if mask_area_ratio < mask_min_area_ratio:
+                    continue
+
+            if (
+                mask_cache is not None
+                and obj_id is not None
+                and (mask_binary_mask if show_masks else mask_binary_box).any()
+            ):
+                mask_cache[obj_id] = (
+                    mask_binary_mask if show_masks else mask_binary_box
+                )
+
+            mask_np_mask = mask_binary_mask.astype(np.float32)
+            mask_np_box = mask_binary_box.astype(np.float32)
+
             if show_masks:
-                points = self._mask_to_polygon(mask_np, epsilon_factor)
+                points = self._mask_to_polygon(
+                    mask_np_mask, epsilon_factor
+                )
                 if points:
                     shapes.append(
                         {
@@ -1326,19 +1904,66 @@ class SegmentAnything3Video(BaseModel):
 
             if show_rotations:
                 rotation_data = self._mask_to_rotation(
-                    mask_np, rotation_min_area
+                    mask_np_box, rotation_min_area
                 )
                 if rotation_data:
+                    points_src = rotation_data.pop("points", None)
+                    curr_box = None
+                    if points_src is not None:
+                        curr_box = self._box_from_points_with_angle(
+                            points_src, rotation_data["angle"]
+                        )
+                        if curr_box:
+                            rotation_data = curr_box
                     rotation_key = group_id if group_id is not None else i
                     if rotation_cache is not None:
                         prev = rotation_cache.get(rotation_key)
-                        if prev:
-                            rotation_data = self._smooth_rotation(
-                                prev,
-                                rotation_data,
+                        if prev and points_src is not None:
+                            angle = rotation_data["angle"]
+                            if (
+                                rotation_lock_area_ratio > 0
+                                and curr_box is not None
+                            ):
+                                prev_box = self._box_from_points_with_angle(
+                                    points_src, prev["angle"]
+                                )
+                                if prev_box:
+                                    area_ratio = prev_box["area"] / max(
+                                        curr_box["area"], 1e-6
+                                    )
+                                    if (
+                                        area_ratio
+                                        <= rotation_lock_area_ratio
+                                    ):
+                                        angle = prev["angle"]
+                            angle = self._smooth_rotation_angle(
+                                prev["angle"],
+                                angle,
                                 rotation_smooth,
                                 rotation_max_delta,
                             )
+                            stable_box = self._box_from_points_with_angle(
+                                points_src, angle
+                            )
+                            if stable_box:
+                                if (
+                                    rotation_lock_area_ratio > 0
+                                    and curr_box is not None
+                                ):
+                                    area_ratio = stable_box["area"] / max(
+                                        curr_box["area"], 1e-6
+                                    )
+                                    if (
+                                        area_ratio
+                                        <= rotation_lock_area_ratio
+                                    ):
+                                        rotation_data = stable_box
+                                        rotation_data["angle"] = angle
+                                    else:
+                                        rotation_data = curr_box
+                                else:
+                                    rotation_data = stable_box
+                                    rotation_data["angle"] = angle
                         rotation_cache[rotation_key] = rotation_data
 
                     box = rotation_data["box"]
@@ -1356,33 +1981,73 @@ class SegmentAnything3Video(BaseModel):
                     )
 
             if show_boxes:
-                try:
-                    box_xywh = out_boxes_xywh[i]
-                except (IndexError, TypeError):
-                    continue
-
-                x_norm, y_norm, w_norm, h_norm = box_xywh
-                x_min = float(x_norm * orig_width)
-                y_min = float(y_norm * orig_height)
-                x_max = float((x_norm + w_norm) * orig_width)
-                y_max = float((y_norm + h_norm) * orig_height)
-
-                shapes.append(
-                    {
-                        "label": label,
-                        "shape_type": "rectangle",
-                        "points": [
+                box_points = None
+                if use_mask_bbox:
+                    box_points = self._mask_to_hbb(mask_binary_box)
+                if box_points is None:
+                    try:
+                        box_xywh = out_boxes_xywh[i]
+                    except (IndexError, TypeError):
+                        box_xywh = None
+                    if box_xywh is not None:
+                        x_norm, y_norm, w_norm, h_norm = box_xywh
+                        x_min = float(x_norm * orig_width)
+                        y_min = float(y_norm * orig_height)
+                        x_max = float((x_norm + w_norm) * orig_width)
+                        y_max = float((y_norm + h_norm) * orig_height)
+                        box_points = [
                             [x_min, y_min],
                             [x_max, y_min],
                             [x_max, y_max],
                             [x_min, y_max],
-                        ],
-                        "score": score,
-                        "group_id": group_id,
-                    }
-                )
+                        ]
+
+                if box_points:
+                    shapes.append(
+                        {
+                            "label": label,
+                            "shape_type": "rectangle",
+                            "points": box_points,
+                            "score": score,
+                            "group_id": group_id,
+                        }
+                    )
 
         return shapes
+
+    def _mask_iou(self, mask_a: np.ndarray, mask_b: np.ndarray) -> float:
+        if mask_a is None or mask_b is None:
+            return 0.0
+        inter = np.logical_and(mask_a, mask_b).sum()
+        if inter == 0:
+            return 0.0
+        union = np.logical_or(mask_a, mask_b).sum()
+        if union == 0:
+            return 0.0
+        return float(inter) / float(union)
+
+    def _expand_mask(
+        self, mask: np.ndarray, expand_ratio: float
+    ) -> np.ndarray:
+        if mask is None:
+            return mask
+        if expand_ratio <= 0:
+            return mask
+        height, width = mask.shape[:2]
+        base = min(height, width)
+        if base <= 0:
+            return mask
+        radius = int(round(base * expand_ratio))
+        if radius < 1:
+            return mask
+        kernel_size = radius * 2 + 1
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (kernel_size, kernel_size)
+        )
+        expanded = cv2.dilate(
+            mask.astype(np.uint8), kernel, iterations=1
+        )
+        return expanded.astype(bool)
 
     def _mask_to_polygon(
         self, mask: np.ndarray, epsilon_factor: float = 0.001
@@ -1421,6 +2086,98 @@ class SegmentAnything3Video(BaseModel):
 
         return points
 
+    def _mask_to_hbb(self, mask: np.ndarray) -> Optional[List[List[float]]]:
+        mask_uint8 = (mask > 0.5).astype(np.uint8)
+        ys, xs = np.where(mask_uint8 > 0)
+        if xs.size == 0 or ys.size == 0:
+            return None
+        x_min = float(xs.min())
+        y_min = float(ys.min())
+        x_max = float(xs.max())
+        y_max = float(ys.max())
+        return [
+            [x_min, y_min],
+            [x_max, y_min],
+            [x_max, y_max],
+            [x_min, y_max],
+        ]
+
+    def _box_from_points_with_angle(
+        self, points: np.ndarray, angle_rad: float
+    ) -> Optional[Dict[str, Any]]:
+        if points is None or len(points) == 0:
+            return None
+
+        def compute_box(theta: float) -> Optional[Dict[str, Any]]:
+            c = math.cos(theta)
+            s = math.sin(theta)
+            rot = np.array([[c, s], [-s, c]], dtype=np.float32)
+            pts_rot = points @ rot.T
+            min_xy = pts_rot.min(axis=0)
+            max_xy = pts_rot.max(axis=0)
+            w = float(max_xy[0] - min_xy[0])
+            h = float(max_xy[1] - min_xy[1])
+            if w <= 0 or h <= 0:
+                return None
+            cx = float((min_xy[0] + max_xy[0]) / 2)
+            cy = float((min_xy[1] + max_xy[1]) / 2)
+            inv = np.array([[c, -s], [s, c]], dtype=np.float32)
+            center = np.array([cx, cy], dtype=np.float32) @ inv.T
+            corners = np.array(
+                [
+                    [min_xy[0], min_xy[1]],
+                    [max_xy[0], min_xy[1]],
+                    [max_xy[0], max_xy[1]],
+                    [min_xy[0], max_xy[1]],
+                ],
+                dtype=np.float32,
+            )
+            corners = corners @ inv.T
+            return {
+                "center": (float(center[0]), float(center[1])),
+                "size": (w, h),
+                "angle": float(theta % math.pi),
+                "box": corners,
+                "area": float(w * h),
+            }
+
+        box = compute_box(angle_rad)
+        if box is None:
+            return None
+        if box["size"][0] < box["size"][1]:
+            angle_rad = (angle_rad + math.pi / 2) % math.pi
+            box = compute_box(angle_rad)
+        return box
+
+    def _smooth_rotation_angle(
+        self, prev_angle: float, curr_angle: float, alpha: float, max_delta: float
+    ) -> float:
+        pa = float(prev_angle) % math.pi
+        ca = float(curr_angle) % math.pi
+
+        max_delta_val = float(max_delta) if max_delta is not None else 0.0
+        if max_delta_val > math.pi:
+            max_delta_val = math.radians(max_delta_val)
+        if max_delta_val > 0:
+            max_delta_val = min(max_delta_val, math.pi / 2)
+            delta = ((ca - pa + math.pi / 2) % math.pi) - math.pi / 2
+            if abs(delta) > max_delta_val:
+                ca = (pa + math.copysign(max_delta_val, delta)) % math.pi
+
+        if alpha <= 0 or alpha >= 1:
+            angle = ca
+        else:
+            sin_val = (1 - alpha) * math.sin(2 * pa) + alpha * math.sin(
+                2 * ca
+            )
+            cos_val = (1 - alpha) * math.cos(2 * pa) + alpha * math.cos(
+                2 * ca
+            )
+            angle = 0.5 * math.atan2(sin_val, cos_val)
+            if angle < 0:
+                angle += math.pi
+        return float(angle)
+
     def _mask_to_rotation(
         self, mask: np.ndarray, min_area: float = 10.0
     ) -> Optional[Dict[str, Any]]:
@@ -1437,21 +2194,19 @@ class SegmentAnything3Video(BaseModel):
             return None
 
         rect = cv2.minAreaRect(largest_contour)
-        (cx, cy), (w, h), angle_deg = rect
+        (_, _), (w, h), angle_deg = rect
         if w <= 0 or h <= 0:
             return None
-        if w < h:
-            w, h = h, w
-            angle_deg += 90.0
 
         angle_rad = math.radians(angle_deg) % math.pi
-        box = cv2.boxPoints(((cx, cy), (w, h), angle_deg))
-        return {
-            "center": (float(cx), float(cy)),
-            "size": (float(w), float(h)),
-            "angle": float(angle_rad),
-            "box": box,
-        }
+        points_src = largest_contour.reshape(-1, 2).astype(np.float32)
+        rotation_data = self._box_from_points_with_angle(
+            points_src, angle_rad
+        )
+        if not rotation_data:
+            return None
+        rotation_data["points"] = points_src
+        return rotation_data
 
     def _smooth_rotation(
         self,

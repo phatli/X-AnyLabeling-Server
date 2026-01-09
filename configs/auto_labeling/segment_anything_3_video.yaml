@@ -8,13 +8,32 @@ params:
   model_path: "/workspace/x_anylabeling_server/models/sam3.pt"
   devices: [0]
   conf_threshold: 0.25
+  tracker_conf_threshold: 0.25
+  tracker_drop_frames: 3
+  tracker_drop_threshold: 0.25
+  mask_min_area_ratio: 0.0
+  mask_expand_ratio: 0.0
+  mask_union_iou: 0.0
+  mask_union_max_area_ratio: 0.0
+  sam3_apply_temporal_disambiguation: true
+  sam3_dynamic_multimask_stability_thresh: 0.98
+  sam3_dynamic_multimask_stability_delta: 0.05
+  sam3_mf_threshold: 0.01
+  use_mask_bbox: true
   show_boxes: false
   show_masks: false
   show_rotations: true
   rotation_smooth: 0.6
   rotation_min_area: 10
   rotation_max_delta: 30
+  rotation_lock_area_ratio: 1.2
   epsilon_factor: 0.001
+  propagate_chunk_size: 40
+  offload_video_to_cpu: true
+  async_loading_frames: true
+  clear_cache_interval: 20
+  max_sessions: 1
+  video_loader_type: "cv2"
 
 widgets:
   - name: button_add_point

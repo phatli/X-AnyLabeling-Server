@@ -34,6 +34,9 @@ class Sam3VideoPredictor:
         async_loading_frames=False,
         video_loader_type="cv2",
         apply_temporal_disambiguation: bool = True,
+        dynamic_multimask_stability_thresh: Optional[float] = None,
+        dynamic_multimask_stability_delta: Optional[float] = None,
+        mf_threshold: Optional[float] = None,
     ):
         self.async_loading_frames = async_loading_frames
         self.video_loader_type = video_loader_type
@@ -47,6 +50,9 @@ class Sam3VideoPredictor:
                 geo_encoder_use_img_cross_attn=geo_encoder_use_img_cross_attn,
                 strict_state_dict_loading=strict_state_dict_loading,
                 apply_temporal_disambiguation=apply_temporal_disambiguation,
+                dynamic_multimask_stability_thresh=dynamic_multimask_stability_thresh,
+                dynamic_multimask_stability_delta=dynamic_multimask_stability_delta,
+                mf_threshold=mf_threshold,
             )
             .cuda()
             .eval()
@@ -60,6 +66,9 @@ class Sam3VideoPredictor:
             return self.start_session(
                 resource_path=request["resource_path"],
                 session_id=request.get("session_id", None),
+                offload_video_to_cpu=request.get(
+                    "offload_video_to_cpu", False
+                ),
             )
         elif request_type == "add_prompt":
             return self.add_prompt(
@@ -103,7 +112,9 @@ class Sam3VideoPredictor:
         else:
             raise RuntimeError(f"invalid request type: {request_type}")
 
-    def start_session(self, resource_path, session_id=None):
+    def start_session(
+        self, resource_path, session_id=None, offload_video_to_cpu=False
+    ):
         """
         Start a new inference session on an image or a video. Here `resource_path`
         can be either a path to an image file (for image inference) or an MP4 file
@@ -116,6 +127,7 @@ class Sam3VideoPredictor:
         # get an initial inference_state from the model
         inference_state = self.model.init_state(
             resource_path=resource_path,
+            offload_video_to_cpu=offload_video_to_cpu,
             async_loading_frames=self.async_loading_frames,
             video_loader_type=self.video_loader_type,
         )

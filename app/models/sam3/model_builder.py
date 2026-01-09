@@ -440,6 +440,9 @@ def _create_tracker_transformer():
 
 def build_tracker(
     apply_temporal_disambiguation: bool,
+    dynamic_multimask_stability_thresh: Optional[float] = None,
+    dynamic_multimask_stability_delta: Optional[float] = None,
+    mf_threshold: Optional[float] = None,
     with_backbone: bool = False,
     compile_mode=None,
 ) -> Sam3TrackerPredictor:
@@ -458,6 +461,25 @@ def build_tracker(
         vision_backbone = _create_vision_backbone(compile_mode=compile_mode)
         backbone = SAM3VLBackbone(scalp=1, visual=vision_backbone, text=None)
     # Create the Tracker module
+    stability_thresh = 0.98
+    if dynamic_multimask_stability_thresh is not None:
+        try:
+            stability_thresh = float(dynamic_multimask_stability_thresh)
+        except (TypeError, ValueError):
+            stability_thresh = 0.98
+    stability_delta = 0.05
+    if dynamic_multimask_stability_delta is not None:
+        try:
+            stability_delta = float(dynamic_multimask_stability_delta)
+        except (TypeError, ValueError):
+            stability_delta = 0.05
+    if mf_threshold is None:
+        mf_threshold = 0.01
+    try:
+        mf_threshold = float(mf_threshold)
+    except (TypeError, ValueError):
+        mf_threshold = 0.01
+
     model = Sam3TrackerPredictor(
         image_size=1008,
         num_maskmem=7,
@@ -469,7 +491,7 @@ def build_tracker(
         multimask_output_in_sam=True,
         # Evaluation
         forward_backbone_per_frame_for_eval=True,
-        trim_past_non_cond_mem_for_eval=False,
+        trim_past_non_cond_mem_for_eval=True,
         # Multimask
         multimask_output_for_tracking=True,
         multimask_min_pt_num=0,
@@ -480,16 +502,17 @@ def build_tracker(
         non_overlap_masks_for_mem_enc=False,
         non_overlap_masks_for_output=False,
         max_cond_frames_in_attn=4,
-        offload_output_to_cpu_for_eval=False,
+        offload_output_to_cpu_for_eval=True,
         # SAM decoder settings
         sam_mask_decoder_extra_args={
             "dynamic_multimask_via_stability": True,
-            "dynamic_multimask_stability_delta": 0.05,
-            "dynamic_multimask_stability_thresh": 0.98,
+            "dynamic_multimask_stability_delta": stability_delta,
+            "dynamic_multimask_stability_thresh": stability_thresh,
         },
         clear_non_cond_mem_around_input=True,
         fill_hole_area=0,
         use_memory_selection=apply_temporal_disambiguation,
+        mf_threshold=mf_threshold,
     )
 
     return model
@@ -676,6 +699,9 @@ def build_sam3_video_model(
     geo_encoder_use_img_cross_attn: bool = True,
     strict_state_dict_loading: bool = True,
     apply_temporal_disambiguation: bool = True,
+    dynamic_multimask_stability_thresh: Optional[float] = None,
+    dynamic_multimask_stability_delta: Optional[float] = None,
+    mf_threshold: Optional[float] = None,
     device="cuda" if torch.cuda.is_available() else "cpu",
     compile=False,
 ) -> Sam3VideoInferenceWithInstanceInteractivity:
@@ -699,7 +725,10 @@ def build_sam3_video_model(
 
     # Build Tracker module
     tracker = build_tracker(
-        apply_temporal_disambiguation=apply_temporal_disambiguation
+        apply_temporal_disambiguation=apply_temporal_disambiguation,
+        dynamic_multimask_stability_thresh=dynamic_multimask_stability_thresh,
+        dynamic_multimask_stability_delta=dynamic_multimask_stability_delta,
+        mf_threshold=mf_threshold,
     )
 
     # Build Detector components

@@ -1189,6 +1189,9 @@ class Sam3TrackerBase(torch.nn.Module):
                 trimmed_out["maskmem_pos_enc"] = [
                     x.cpu() for x in maskmem_pos_enc
                 ]
+            else:
+                trimmed_out["maskmem_features"] = None
+                trimmed_out["maskmem_pos_enc"] = None
             if self.use_memory_selection:
                 trimmed_out["iou_score"] = current_out["iou_score"].cpu()
                 trimmed_out["eff_iou_score"] = current_out[
@@ -1216,7 +1219,6 @@ class Sam3TrackerBase(torch.nn.Module):
             )
 
             if past_out is not None:
-                print(past_out.get("eff_iou_score", 0))
                 if (
                     self.use_memory_selection
                     and past_out.get("eff_iou_score", 0) < self.mf_threshold

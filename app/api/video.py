@@ -215,9 +215,7 @@ async def propagate_video(request: VideoPropagateRequest):
         )
 
     try:
-        result = model.start_propagation(
-            session_id, request.start_frame, request.end_frame
-        )
+        result = model.start_propagation(session_id, request.start_frame, None)
 
         if "error" in result:
             return ErrorResponse(
@@ -284,7 +282,7 @@ async def propagate_video_stream(request: VideoPropagateRequest):
     def run_propagation():
         try:
             for event in model.propagate_stream(
-                session_id, request.start_frame, request.end_frame
+                session_id, request.start_frame, None
             ):
                 if stop_signal.is_set():
                     logger.info("Propagation stopped by client disconnect")

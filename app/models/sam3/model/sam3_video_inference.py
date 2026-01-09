@@ -472,6 +472,7 @@ class Sam3VideoInference(Sam3VideoBase):
         if len(curr_obj_ids) == 0:
             out_obj_ids = torch.zeros(0, dtype=torch.int64)
             out_probs = torch.zeros(0, dtype=torch.float32)
+            out_tracker_probs = torch.zeros(0, dtype=torch.float32)
             out_binary_masks = torch.zeros(
                 0, H_video, W_video, dtype=torch.bool
             )
@@ -494,6 +495,10 @@ class Sam3VideoInference(Sam3VideoBase):
             out_binary_masks = torch.cat(
                 [obj_id_to_mask[obj_id] for obj_id in curr_obj_ids], dim=0
             )
+            if out_binary_masks.ndim == 2:
+                out_binary_masks = out_binary_masks.unsqueeze(0)
+            elif out_binary_masks.ndim == 4 and out_binary_masks.size(1) == 1:
+                out_binary_masks = out_binary_masks.squeeze(1)
 
             assert out_binary_masks.dtype == torch.bool
             keep = out_binary_masks.any(
@@ -541,6 +546,8 @@ class Sam3VideoInference(Sam3VideoBase):
             out_boxes_xywh[..., 1] /= H_video
             out_boxes_xywh[..., 2] /= W_video
             out_boxes_xywh[..., 3] /= H_video
+            if out_tracker_probs.numel() == out_probs.numel():
+                out_probs = torch.minimum(out_probs, out_tracker_probs)
 
         # apply non-overlapping constraints on the existing masklets
         if out_binary_masks.shape[0] > 1:
@@ -556,6 +563,7 @@ class Sam3VideoInference(Sam3VideoBase):
         outputs = {
             "out_obj_ids": out_obj_ids.cpu().numpy(),
             "out_probs": out_probs.cpu().numpy(),
+            "out_tracker_probs": out_tracker_probs.cpu().numpy(),
             "out_boxes_xywh": out_boxes_xywh.cpu().numpy(),
             "out_binary_masks": out_binary_masks.cpu().numpy(),
             "frame_stats": out.get("frame_stats", None),
@@ -591,10 +599,10 @@ class Sam3VideoInference(Sam3VideoBase):
     def _build_tracker_output(
         self, inference_state, frame_idx, refined_obj_id_to_mask=None
     ):
-        assert (
-            "cached_frame_outputs" in inference_state
-            and frame_idx in inference_state["cached_frame_outputs"]
-        ), "No cached outputs found. Ensure normal propagation has run first to populate the cache."
+        if "cached_frame_outputs" not in inference_state:
+            inference_state["cached_frame_outputs"] = {}
+        if frame_idx not in inference_state["cached_frame_outputs"]:
+            inference_state["cached_frame_outputs"][frame_idx] = {}
         cached_outputs = inference_state["cached_frame_outputs"][frame_idx]
 
         obj_id_to_mask = cached_outputs.copy()
