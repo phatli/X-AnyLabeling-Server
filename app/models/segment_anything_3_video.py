@@ -40,6 +40,7 @@ class _VideoSession:
         start_frame_index: int,
         predictor: Any,
         offload_video_to_cpu: bool = False,
+        offload_state_to_cpu: bool = False,
     ):
         """Initialize video session.
 
@@ -54,6 +55,7 @@ class _VideoSession:
         self.start_frame_index = start_frame_index
         self.predictor = predictor
         self.offload_video_to_cpu = offload_video_to_cpu
+        self.offload_state_to_cpu = offload_state_to_cpu
         self.text_prompt: Optional[str] = None
         self.is_point_prompt: bool = False
         self.last_prompt_frame: Optional[int] = None
@@ -83,6 +85,7 @@ class _VideoSession:
                 resource_path=frame_dir,
                 session_id=self.session_id,
                 offload_video_to_cpu=self.offload_video_to_cpu,
+                offload_state_to_cpu=self.offload_state_to_cpu,
             )
         )
         logger.info(
@@ -188,6 +191,12 @@ class SegmentAnything3Video(BaseModel):
                 os.getenv("SAM3_OFFLOAD_VIDEO_TO_CPU", "false"),
             )
         )
+        self._offload_state_to_cpu = self._parse_bool(
+            self.params.get(
+                "offload_state_to_cpu",
+                os.getenv("SAM3_OFFLOAD_STATE_TO_CPU", "false"),
+            )
+        )
         self._async_loading_frames = self._parse_bool(
             self.params.get(
                 "async_loading_frames",
@@ -239,6 +248,9 @@ class SegmentAnything3Video(BaseModel):
         bpe_path = self.params.get("bpe_path")
         model_path = self.params.get("model_path")
         devices = self.params.get("devices", [0])
+        image_size = self._parse_int(self.params.get("image_size", 1008), 1008)
+        if image_size <= 0:
+            image_size = 1008
 
         if isinstance(devices, list) and devices:
             gpus_to_use = range(len(devices))
@@ -287,16 +299,24 @@ class SegmentAnything3Video(BaseModel):
         except (TypeError, ValueError):
             mf_threshold = None
 
+        strict_state_dict_loading = self._parse_bool(
+            self.params.get("strict_state_dict_loading", True)
+        )
+        if image_size != 1008:
+            strict_state_dict_loading = False
+
         self.predictor = build_sam3_video_predictor(
             gpus_to_use=gpus_to_use,
             bpe_path=bpe_path,
             checkpoint_path=model_path,
+            image_size=image_size,
             async_loading_frames=self._async_loading_frames,
             video_loader_type=self._video_loader_type,
             apply_temporal_disambiguation=apply_temporal_disambiguation,
             dynamic_multimask_stability_thresh=stability_thresh,
             dynamic_multimask_stability_delta=stability_delta,
             mf_threshold=mf_threshold,
+            strict_state_dict_loading=strict_state_dict_loading,
         )
 
         logger.info("SAM3 video model loaded successfully")
@@ -357,6 +377,7 @@ class SegmentAnything3Video(BaseModel):
                 start_frame_index,
                 self.predictor,
                 offload_video_to_cpu=self._offload_video_to_cpu,
+                offload_state_to_cpu=self._offload_state_to_cpu,
             )
             self._sessions[session_id] = session
 
@@ -946,6 +967,8 @@ class SegmentAnything3Video(BaseModel):
                     start_frame_index=chunk_start,
                     max_frame_num_to_track=max(chunk_end - chunk_start, 0),
                 )
+                if chunk_size > 0:
+                    request_dict["force_propagation"] = True
 
                 generator = session.predictor.handle_stream_request(
                     request=request_dict
@@ -1567,6 +1590,7 @@ class SegmentAnything3Video(BaseModel):
             torch.cuda.empty_cache()
             if hasattr(torch.cuda, "ipc_collect"):
                 torch.cuda.ipc_collect()
+
 
     def _normalize_obj_ids(self, obj_ids: Any) -> np.ndarray:
         """Normalize object IDs to numpy array.

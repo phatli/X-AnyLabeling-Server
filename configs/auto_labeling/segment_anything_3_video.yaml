@@ -28,8 +28,10 @@ params:
   rotation_max_delta: 30
   rotation_lock_area_ratio: 1.2
   epsilon_factor: 0.001
-  propagate_chunk_size: 40
+  image_size: 768
+  propagate_chunk_size: 20
   offload_video_to_cpu: true
+  offload_state_to_cpu: true
   async_loading_frames: true
   clear_cache_interval: 20
   max_sessions: 1

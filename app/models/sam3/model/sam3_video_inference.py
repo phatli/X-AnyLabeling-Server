@@ -59,6 +59,7 @@ class Sam3VideoInference(Sam3VideoBase):
         self,
         resource_path,
         offload_video_to_cpu=False,
+        offload_state_to_cpu=False,
         async_loading_frames=False,
         video_loader_type="cv2",
     ):
@@ -75,6 +76,7 @@ class Sam3VideoInference(Sam3VideoBase):
         inference_state = {}
         inference_state["image_size"] = self.image_size
         inference_state["num_frames"] = len(images)
+        inference_state["offload_state_to_cpu"] = offload_state_to_cpu
         # the original video height and width, used for resizing final output scores
         inference_state["orig_height"] = orig_height
         inference_state["orig_width"] = orig_width
@@ -1083,6 +1085,9 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
             video_height=inference_state["orig_height"],
             video_width=inference_state["orig_width"],
             num_frames=inference_state["num_frames"],
+            offload_state_to_cpu=inference_state.get(
+                "offload_state_to_cpu", False
+            ),
         )
 
     @torch.inference_mode()
@@ -1092,10 +1097,11 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
         start_frame_idx=None,
         max_frame_num_to_track=None,
         reverse=False,
+        force_propagation=False,
     ):
         # step 1: check which type of propagation to run, should be the same for all GPUs.
         propagation_type, obj_ids = self.parse_action_history_for_propagation(
-            inference_state
+            inference_state, force_propagation=force_propagation
         )
         self.add_action_history(
             inference_state,
@@ -1326,7 +1332,9 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
                     return True
         return False
 
-    def parse_action_history_for_propagation(self, inference_state):
+    def parse_action_history_for_propagation(
+        self, inference_state, force_propagation=False
+    ):
         """
         Parse the actions in history before the last propagation and prepare for the next propagation.
         We support multiple actions (add/remove/refine) between two propagations. If we had an action
@@ -1343,6 +1351,25 @@ class Sam3VideoInferenceWithInstanceInteractivity(Sam3VideoInference):
         action_history = inference_state["action_history"]
         if len(action_history) == 0:
             # we run propagation for the first time
+            return "propagation_full", None
+
+        if force_propagation:
+            obj_ids = []
+            for action in action_history[::-1]:
+                if "propagation" in action["type"]:
+                    break
+                if action["type"] in ["add", "refine"] and action.get("obj_ids"):
+                    obj_ids.extend(action["obj_ids"])
+            obj_ids = list(set(obj_ids)) if len(obj_ids) > 0 else None
+            if obj_ids is not None:
+                return "propagation_partial", obj_ids
+
+            last_action = action_history[-1]
+            if "propagation" in last_action["type"]:
+                if last_action["type"] == "propagation_fetch":
+                    return "propagation_full", None
+                return last_action["type"], last_action.get("obj_ids")
+
             return "propagation_full", None
 
         if "propagation" in action_history[-1]["type"]:

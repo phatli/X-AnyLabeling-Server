@@ -37,6 +37,7 @@ class Sam3VideoPredictor:
         dynamic_multimask_stability_thresh: Optional[float] = None,
         dynamic_multimask_stability_delta: Optional[float] = None,
         mf_threshold: Optional[float] = None,
+        image_size: int = 1008,
     ):
         self.async_loading_frames = async_loading_frames
         self.video_loader_type = video_loader_type
@@ -53,6 +54,7 @@ class Sam3VideoPredictor:
                 dynamic_multimask_stability_thresh=dynamic_multimask_stability_thresh,
                 dynamic_multimask_stability_delta=dynamic_multimask_stability_delta,
                 mf_threshold=mf_threshold,
+                image_size=image_size,
             )
             .cuda()
             .eval()
@@ -68,6 +70,9 @@ class Sam3VideoPredictor:
                 session_id=request.get("session_id", None),
                 offload_video_to_cpu=request.get(
                     "offload_video_to_cpu", False
+                ),
+                offload_state_to_cpu=request.get(
+                    "offload_state_to_cpu", False
                 ),
             )
         elif request_type == "add_prompt":
@@ -108,12 +113,17 @@ class Sam3VideoPredictor:
                 max_frame_num_to_track=request.get(
                     "max_frame_num_to_track", None
                 ),
+                force_propagation=request.get("force_propagation", False),
             )
         else:
             raise RuntimeError(f"invalid request type: {request_type}")
 
     def start_session(
-        self, resource_path, session_id=None, offload_video_to_cpu=False
+        self,
+        resource_path,
+        session_id=None,
+        offload_video_to_cpu=False,
+        offload_state_to_cpu=False,
     ):
         """
         Start a new inference session on an image or a video. Here `resource_path`
@@ -128,6 +138,7 @@ class Sam3VideoPredictor:
         inference_state = self.model.init_state(
             resource_path=resource_path,
             offload_video_to_cpu=offload_video_to_cpu,
+            offload_state_to_cpu=offload_state_to_cpu,
             async_loading_frames=self.async_loading_frames,
             video_loader_type=self.video_loader_type,
         )
@@ -203,6 +214,7 @@ class Sam3VideoPredictor:
         propagation_direction,
         start_frame_idx,
         max_frame_num_to_track,
+        force_propagation=False,
     ):
         """Propagate the added prompts to get grounding results on all video frames."""
         logger.debug(
@@ -224,6 +236,7 @@ class Sam3VideoPredictor:
                     start_frame_idx=start_frame_idx,
                     max_frame_num_to_track=max_frame_num_to_track,
                     reverse=False,
+                    force_propagation=force_propagation,
                 ):
                     yield {"frame_index": frame_idx, "outputs": outputs}
             # Then doing the backward propagation (reverse in time)
@@ -233,6 +246,7 @@ class Sam3VideoPredictor:
                     start_frame_idx=start_frame_idx,
                     max_frame_num_to_track=max_frame_num_to_track,
                     reverse=True,
+                    force_propagation=force_propagation,
                 ):
                     yield {"frame_index": frame_idx, "outputs": outputs}
         finally:
