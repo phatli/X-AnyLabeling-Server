@@ -41,6 +41,8 @@ class _VideoSession:
         predictor: Any,
         offload_video_to_cpu: bool = False,
         offload_state_to_cpu: bool = False,
+        full_frames: Optional[List[np.ndarray]] = None,
+        segment_frame_limit: int = 0,
     ):
         """Initialize video session.
 
@@ -56,15 +58,25 @@ class _VideoSession:
         self.predictor = predictor
         self.offload_video_to_cpu = offload_video_to_cpu
         self.offload_state_to_cpu = offload_state_to_cpu
+        self.full_frames = full_frames if full_frames is not None else frames
+        self.segment_frame_limit = max(int(segment_frame_limit), 0)
+        self.segment_frame_limit_max = self.segment_frame_limit
+        self.segment_index = 0
         self.text_prompt: Optional[str] = None
         self.is_point_prompt: bool = False
         self.last_prompt_frame: Optional[int] = None
         self.prompt_frame_outputs: Optional[Dict[str, Any]] = None
         self.prompt_frame_params: Optional[Dict[str, Any]] = None
+        self.prompt_points: Optional[List[List[float]]] = None
+        self.prompt_point_labels: Optional[List[int]] = None
+        self.prompt_obj_id: Optional[int] = None
         self.rotation_cache: Dict[int, Dict[str, Any]] = {}
         self.low_conf_frames: Dict[int, int] = {}
         self.suppressed_obj_ids: set[int] = set()
         self.mask_cache: Dict[int, np.ndarray] = {}
+        self.last_outputs: Optional[Dict[str, Any]] = None
+        self.last_output_frame: Optional[int] = None
+        self.last_restart_mask: Optional[np.ndarray] = None
         self.created_at = time.time()
         self.temp_dir: Optional[str] = None
         self._init_predictor_session()
@@ -167,6 +179,22 @@ class SegmentAnything3Video(BaseModel):
         self._sessions_lock = threading.Lock()
         self._tasks_lock = threading.Lock()
         self._executor = ThreadPoolExecutor(max_workers=1)
+        self._predictor_lock = threading.Lock()
+        self._allowed_image_sizes = {768, 960, 1008}
+        self._current_image_size = self._parse_int(
+            self.params.get("image_size", 1008), 1008
+        )
+        if self._current_image_size <= 0:
+            self._current_image_size = 1008
+        self._default_session_frame_limit = self._parse_int(
+            self.params.get(
+                "session_frame_limit",
+                os.getenv("SAM3_SESSION_FRAME_LIMIT", "0"),
+            ),
+            0,
+        )
+        if self._default_session_frame_limit < 0:
+            self._default_session_frame_limit = 0
         self._max_sessions = self._parse_int(
             self.params.get(
                 "max_sessions", os.getenv("SAM3_MAX_SESSIONS", "1")
@@ -237,20 +265,12 @@ class SegmentAnything3Video(BaseModel):
             return value
         return str(value).strip().lower() in {"1", "true", "y", "yes"}
 
-    def load(self):
-        """Load SAM3 video model and initialize components."""
-        sam3_parent_dir = os.path.join(os.path.dirname(__file__))
-        if sam3_parent_dir not in sys.path:
-            sys.path.insert(0, sam3_parent_dir)
-
+    def _build_predictor(self, image_size: int) -> None:
         from sam3.model_builder import build_sam3_video_predictor
 
         bpe_path = self.params.get("bpe_path")
         model_path = self.params.get("model_path")
         devices = self.params.get("devices", [0])
-        image_size = self._parse_int(self.params.get("image_size", 1008), 1008)
-        if image_size <= 0:
-            image_size = 1008
 
         if isinstance(devices, list) and devices:
             gpus_to_use = range(len(devices))
@@ -329,6 +349,49 @@ class SegmentAnything3Video(BaseModel):
                 if param.dtype != torch.float32 and "bias" in name:
                     param.data = param.data.float()
 
+        self._current_image_size = image_size
+
+    def _ensure_predictor_image_size(self, image_size: int) -> None:
+        image_size = self._normalize_image_size(image_size)
+        with self._predictor_lock:
+            if (
+                self.predictor is not None
+                and image_size == self._current_image_size
+            ):
+                return
+            logger.info(
+                f"Reloading SAM3 predictor for image_size={image_size}"
+            )
+            try:
+                self.cleanup_all()
+            except Exception as e:
+                logger.warning(f"Predictor cleanup before reload failed: {e}")
+            if self.predictor is not None:
+                try:
+                    self.predictor.shutdown()
+                except Exception as e:
+                    logger.warning(
+                        f"Predictor shutdown before reload failed: {e}"
+                    )
+            self.predictor = None
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                if hasattr(torch.cuda, "ipc_collect"):
+                    torch.cuda.ipc_collect()
+            self._build_predictor(image_size)
+
+    def load(self):
+        """Load SAM3 video model and initialize components."""
+        sam3_parent_dir = os.path.join(os.path.dirname(__file__))
+        if sam3_parent_dir not in sys.path:
+            sys.path.insert(0, sam3_parent_dir)
+
+        image_size = self._normalize_image_size(
+            self.params.get("image_size", 1008)
+        )
+        self._build_predictor(image_size)
+
     def predict(
         self, image: np.ndarray, params: Dict[str, Any]
     ) -> Dict[str, Any]:
@@ -348,7 +411,11 @@ class SegmentAnything3Video(BaseModel):
         return {"shapes": [], "description": ""}
 
     def init_session(
-        self, frames: List[np.ndarray], start_frame_index: int
+        self,
+        frames: List[np.ndarray],
+        start_frame_index: int,
+        image_size: Optional[int] = None,
+        session_frame_limit: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Initialize a new video session.
 
@@ -359,6 +426,27 @@ class SegmentAnything3Video(BaseModel):
         Returns:
             Dictionary with session_id, num_frames, start_frame_index.
         """
+        requested_image_size = (
+            self._normalize_image_size(image_size)
+            if image_size is not None
+            else self._current_image_size
+        )
+        self._ensure_predictor_image_size(requested_image_size)
+
+        segment_limit = (
+            self._parse_int(session_frame_limit, self._default_session_frame_limit)
+            if session_frame_limit is not None
+            else self._default_session_frame_limit
+        )
+        if segment_limit < 0:
+            segment_limit = 0
+
+        segment_frames = self._slice_frames(
+            frames, start_frame_index, segment_limit
+        )
+        if not segment_frames:
+            return {"error": "No frames available for session initialization"}
+
         with self._sessions_lock:
             if len(self._sessions) >= self._max_sessions:
                 self._cleanup_oldest_session()
@@ -371,20 +459,54 @@ class SegmentAnything3Video(BaseModel):
                 )
                 self._sessions[session_id].cleanup()
 
-            session = _VideoSession(
-                session_id,
-                frames,
-                start_frame_index,
-                self.predictor,
-                offload_video_to_cpu=self._offload_video_to_cpu,
-                offload_state_to_cpu=self._offload_state_to_cpu,
-            )
+            attempt_limit = segment_limit
+            while True:
+                try:
+                    session = _VideoSession(
+                        session_id,
+                        segment_frames,
+                        start_frame_index,
+                        self.predictor,
+                        offload_video_to_cpu=self._offload_video_to_cpu,
+                        offload_state_to_cpu=self._offload_state_to_cpu,
+                        full_frames=frames,
+                        segment_frame_limit=attempt_limit,
+                    )
+                    break
+                except Exception as e:
+                    if not self._is_oom_error(e):
+                        raise
+                    remaining = max(len(frames) - start_frame_index, 0)
+                    previous_limit = attempt_limit
+                    if attempt_limit <= 0:
+                        attempt_limit = max(1, min(30, remaining))
+                    else:
+                        attempt_limit = max(1, attempt_limit // 2)
+                    if attempt_limit == previous_limit:
+                        return {
+                            "error": "GPU out of memory during session init"
+                        }
+                    segment_frames = self._slice_frames(
+                        frames, start_frame_index, attempt_limit
+                    )
+                    if not segment_frames:
+                        return {
+                            "error": "GPU out of memory during session init"
+                        }
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                        if hasattr(torch.cuda, "ipc_collect"):
+                            torch.cuda.ipc_collect()
+                    continue
+            if segment_limit > 0:
+                session.segment_frame_limit_max = segment_limit
             self._sessions[session_id] = session
 
         return {
             "session_id": session_id,
-            "num_frames": len(frames),
+            "num_frames": len(segment_frames),
             "start_frame_index": start_frame_index,
+            "total_frames": len(frames),
         }
 
     def add_prompt(
@@ -420,37 +542,86 @@ class SegmentAnything3Video(BaseModel):
             session.prompt_frame_outputs = None
             session.prompt_frame_params = None
             session.text_prompt = None
+            session.prompt_points = None
+            session.prompt_point_labels = None
+            session.prompt_obj_id = None
+            session.prompt_points = None
+            session.prompt_point_labels = None
+            session.prompt_obj_id = None
 
-        relative_frame_index = frame_index - session.start_frame_index
-        if relative_frame_index < 0 or relative_frame_index >= len(
-            session.frames
-        ):
-            return {"error": f"Frame index {frame_index} out of range"}
+        error, restart_info = self._ensure_prompt_frame(session, frame_index)
+        if error:
+            return {"error": error}
+        session_restart = restart_info
 
-        session.predictor.handle_request(
-            request=dict(
-                type="reset_session",
-                session_id=session_id,
-            )
+        full_frames = (
+            session.full_frames if session.full_frames else session.frames
         )
-        session.rotation_cache.clear()
-        session.low_conf_frames.clear()
-        session.suppressed_obj_ids.clear()
-        session.mask_cache.clear()
+        remaining_frames = max(len(full_frames) - frame_index, 0)
 
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            if hasattr(torch.cuda, "ipc_collect"):
-                torch.cuda.ipc_collect()
+        while True:
+            relative_frame_index = frame_index - session.start_frame_index
+            if relative_frame_index < 0 or relative_frame_index >= len(
+                session.frames
+            ):
+                return {"error": f"Frame index {frame_index} out of range"}
 
-        response = session.predictor.handle_request(
-            request=dict(
-                type="add_prompt",
-                session_id=session_id,
-                frame_index=relative_frame_index,
-                text=text_prompt.rstrip("."),
+            session.predictor.handle_request(
+                request=dict(
+                    type="reset_session",
+                    session_id=session_id,
+                )
             )
-        )
+            session.rotation_cache.clear()
+            session.low_conf_frames.clear()
+            session.suppressed_obj_ids.clear()
+            session.mask_cache.clear()
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                if hasattr(torch.cuda, "ipc_collect"):
+                    torch.cuda.ipc_collect()
+
+            try:
+                response = session.predictor.handle_request(
+                    request=dict(
+                        type="add_prompt",
+                        session_id=session_id,
+                        frame_index=relative_frame_index,
+                        text=text_prompt.rstrip("."),
+                    )
+                )
+            except Exception as e:
+                if not self._is_oom_error(e):
+                    raise
+                previous_limit = session.segment_frame_limit
+                if not self._maybe_reduce_segment_limit(
+                    session, remaining_frames
+                ):
+                    logger.warning(
+                        "提示阶段显存不足，无法继续，帧=%d",
+                        frame_index,
+                    )
+                    return {"error": "提示阶段显存不足"}
+                error = self._restart_session_for_segment(
+                    session, frame_index
+                )
+                if error:
+                    return {"error": error}
+                session_restart = {
+                    "frame_index": frame_index,
+                    "segment_frames": session.segment_frame_limit,
+                    "reason": "oom",
+                }
+                if previous_limit != session.segment_frame_limit:
+                    logger.warning(
+                        "提示阶段显存不足，分段帧数从 %d 缩短到 %d，重启于帧 %d",
+                        previous_limit,
+                        session.segment_frame_limit,
+                        frame_index,
+                    )
+                continue
+            break
 
         outputs = response.get("outputs", {})
         if not isinstance(outputs, dict):
@@ -468,6 +639,10 @@ class SegmentAnything3Video(BaseModel):
             return {"frame_index": frame_index, "masks": [], "num_objects": 0}
 
         session.text_prompt = text_prompt
+        session.is_point_prompt = False
+        session.prompt_points = None
+        session.prompt_point_labels = None
+        session.prompt_obj_id = None
         session.last_prompt_frame = frame_index
         session.prompt_frame_outputs = {
             "out_binary_masks": out_binary_masks,
@@ -510,11 +685,14 @@ class SegmentAnything3Video(BaseModel):
             session.mask_cache,
         )
 
-        return {
+        result = {
             "frame_index": frame_index,
             "masks": shapes,
             "num_objects": len(shapes),
         }
+        if session_restart:
+            result["session_restart"] = session_restart
+        return result
 
     def add_point_prompt(
         self,
@@ -542,11 +720,10 @@ class SegmentAnything3Video(BaseModel):
         if not session:
             return {"error": f"Session {session_id} not found"}
 
-        relative_frame_index = frame_index - session.start_frame_index
-        if relative_frame_index < 0 or relative_frame_index >= len(
-            session.frames
-        ):
-            return {"error": f"Frame index {frame_index} out of range"}
+        error, restart_info = self._ensure_prompt_frame(session, frame_index)
+        if error:
+            return {"error": error}
+        session_restart = restart_info
 
         if not points or not point_labels:
             return {"error": "Points and point_labels are required"}
@@ -569,42 +746,86 @@ class SegmentAnything3Video(BaseModel):
             session.prompt_frame_params = None
             session.text_prompt = None
 
-        session.low_conf_frames.clear()
-        session.suppressed_obj_ids.clear()
-
-        try:
-            predictor_session = session.predictor._get_session(session_id)
-            inference_state = predictor_session["state"]
-            if (
-                "cached_frame_outputs" not in inference_state
-                or relative_frame_index
-                not in inference_state["cached_frame_outputs"]
-            ):
-                if "cached_frame_outputs" not in inference_state:
-                    inference_state["cached_frame_outputs"] = {}
-                inference_state["cached_frame_outputs"][
-                    relative_frame_index
-                ] = {}
-        except (AttributeError, RuntimeError, KeyError) as e:
-            logger.warning(
-                f"Could not initialize cache for frame {relative_frame_index}: {e}"
-            )
-
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            if hasattr(torch.cuda, "ipc_collect"):
-                torch.cuda.ipc_collect()
-
-        response = session.predictor.handle_request(
-            request=dict(
-                type="add_prompt",
-                session_id=session_id,
-                frame_index=relative_frame_index,
-                points=points,
-                point_labels=point_labels,
-                obj_id=obj_id,
-            )
+        full_frames = (
+            session.full_frames if session.full_frames else session.frames
         )
+        remaining_frames = max(len(full_frames) - frame_index, 0)
+
+        while True:
+            relative_frame_index = frame_index - session.start_frame_index
+            if relative_frame_index < 0 or relative_frame_index >= len(
+                session.frames
+            ):
+                return {"error": f"Frame index {frame_index} out of range"}
+
+            session.low_conf_frames.clear()
+            session.suppressed_obj_ids.clear()
+
+            try:
+                predictor_session = session.predictor._get_session(session_id)
+                inference_state = predictor_session["state"]
+                if (
+                    "cached_frame_outputs" not in inference_state
+                    or relative_frame_index
+                    not in inference_state["cached_frame_outputs"]
+                ):
+                    if "cached_frame_outputs" not in inference_state:
+                        inference_state["cached_frame_outputs"] = {}
+                    inference_state["cached_frame_outputs"][
+                        relative_frame_index
+                    ] = {}
+            except (AttributeError, RuntimeError, KeyError) as e:
+                logger.warning(
+                    f"Could not initialize cache for frame {relative_frame_index}: {e}"
+                )
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                if hasattr(torch.cuda, "ipc_collect"):
+                    torch.cuda.ipc_collect()
+
+            try:
+                response = session.predictor.handle_request(
+                    request=dict(
+                        type="add_prompt",
+                        session_id=session_id,
+                        frame_index=relative_frame_index,
+                        points=points,
+                        point_labels=point_labels,
+                        obj_id=obj_id,
+                    )
+                )
+            except Exception as e:
+                if not self._is_oom_error(e):
+                    raise
+                previous_limit = session.segment_frame_limit
+                if not self._maybe_reduce_segment_limit(
+                    session, remaining_frames
+                ):
+                    logger.warning(
+                        "提示阶段显存不足，无法继续，帧=%d",
+                        frame_index,
+                    )
+                    return {"error": "提示阶段显存不足"}
+                error = self._restart_session_for_segment(
+                    session, frame_index
+                )
+                if error:
+                    return {"error": error}
+                session_restart = {
+                    "frame_index": frame_index,
+                    "segment_frames": session.segment_frame_limit,
+                    "reason": "oom",
+                }
+                if previous_limit != session.segment_frame_limit:
+                    logger.warning(
+                        "提示阶段显存不足，分段帧数从 %d 缩短到 %d，重启于帧 %d",
+                        previous_limit,
+                        session.segment_frame_limit,
+                        frame_index,
+                    )
+                continue
+            break
 
         outputs = response.get("outputs", {})
         if not isinstance(outputs, dict):
@@ -680,6 +901,10 @@ class SegmentAnything3Video(BaseModel):
             logger.warning(f"Could not initialize cache for all frames: {e}")
 
         session.is_point_prompt = True
+        session.text_prompt = None
+        session.prompt_points = points.copy()
+        session.prompt_point_labels = point_labels.copy()
+        session.prompt_obj_id = obj_id
         session.last_prompt_frame = frame_index
         session.prompt_frame_outputs = {
             "out_binary_masks": out_binary_masks,
@@ -722,11 +947,14 @@ class SegmentAnything3Video(BaseModel):
             session.mask_cache,
         )
 
-        return {
+        result = {
             "frame_index": frame_index,
             "masks": shapes,
             "num_objects": len(shapes),
         }
+        if session_restart:
+            result["session_restart"] = session_restart
+        return result
 
     def start_propagation(
         self,
@@ -874,16 +1102,31 @@ class SegmentAnything3Video(BaseModel):
             }
             return
 
-        rel_start = None
-        rel_end = None
-        if start_frame is not None:
-            rel_start = start_frame - session.start_frame_index
-        if end_frame is not None:
-            rel_end = end_frame - session.start_frame_index
+        full_frames = session.full_frames if session.full_frames else session.frames
+        total_frames = len(full_frames)
+        if total_frames <= 0:
+            yield {
+                "type": "error",
+                "message": "No frames available for propagation",
+            }
+            return
 
-        total_frames = len(session.frames)
-        start_frame_offset = session.start_frame_index
-        orig_height, orig_width = self._get_frame_dimensions(session.frames)
+        overall_start = (
+            start_frame
+            if start_frame is not None
+            else (
+                session.last_prompt_frame
+                if session.last_prompt_frame is not None
+                else session.start_frame_index
+            )
+        )
+        overall_end = end_frame if end_frame is not None else total_frames - 1
+        overall_start = max(0, min(overall_start, total_frames - 1))
+        overall_end = max(0, min(overall_end, total_frames - 1))
+        if overall_end < overall_start:
+            overall_end = overall_start
+
+        frames_to_process = max(overall_end - overall_start + 1, 1)
         text_prompt = (
             session.text_prompt if session.text_prompt else "AUTOLABEL_OBJECT"
         )
@@ -891,10 +1134,11 @@ class SegmentAnything3Video(BaseModel):
         yield {
             "type": "started",
             "total_frames": total_frames,
-            "start_frame_index": start_frame_offset,
+            "start_frame_index": overall_start,
         }
 
         bf16_context = None
+        results: Dict[int, Dict[str, Any]] = {}
         try:
             if torch.cuda.is_available():
                 current_device = torch.cuda.current_device()
@@ -904,202 +1148,337 @@ class SegmentAnything3Video(BaseModel):
                 )
                 bf16_context.__enter__()
 
-            prompt_frame_relative_idx = None
-            prompt_absolute_idx = None
-            if session.last_prompt_frame is not None:
-                prompt_frame_relative_idx = (
-                    session.last_prompt_frame - session.start_frame_index
-                )
-                prompt_absolute_idx = session.last_prompt_frame
-
-            start_idx = (
-                rel_start
-                if rel_start is not None
-                else (
-                    prompt_frame_relative_idx
-                    if prompt_frame_relative_idx is not None
-                    else 0
-                )
-            )
-            end_idx = (
-                rel_end
-                if rel_end is not None
-                else max(total_frames - 1, 0)
-            )
-            if total_frames <= 0:
-                yield {
-                    "type": "error",
-                    "message": "No frames available for propagation",
-                }
-                return
-            start_idx = max(0, min(start_idx, total_frames - 1))
-            end_idx = max(0, min(end_idx, total_frames - 1))
-            if end_idx < start_idx:
-                end_idx = start_idx
-
-            chunk_size = self._propagate_chunk_size
-            if session.prompt_frame_params:
-                override = self._parse_int(
-                    session.prompt_frame_params.get(
-                        "propagate_chunk_size", 0
-                    ),
-                    0,
-                )
-                if override > 0:
-                    chunk_size = override
-            if chunk_size < 0:
-                chunk_size = 0
-
             frame_count = 0
-            results = {}
 
-            chunk_start = start_idx
-            while chunk_start <= end_idx:
-                chunk_end = (
-                    end_idx
-                    if chunk_size <= 0
-                    else min(chunk_start + chunk_size - 1, end_idx)
+            segment_limit = session.segment_frame_limit
+            segment_start = (
+                overall_start if segment_limit > 0 else session.start_frame_index
+            )
+
+            if segment_limit > 0 and segment_start != session.start_frame_index:
+                error = self._restart_session_for_segment(
+                    session, segment_start
                 )
-                request_dict = dict(
-                    type="propagate_in_video",
-                    session_id=session_id,
-                    propagation_direction="forward",
-                    start_frame_index=chunk_start,
-                    max_frame_num_to_track=max(chunk_end - chunk_start, 0),
+                if error:
+                    event = self._build_partial_completion(
+                        results,
+                        f"会话重建失败: {error}，已保存部分结果",
+                        reason="segment",
+                    )
+                    yield event
+                    return
+                error = self._reapply_prompt_for_segment(
+                    session, segment_start
                 )
-                if chunk_size > 0:
-                    request_dict["force_propagation"] = True
+                if error:
+                    event = self._build_partial_completion(
+                        results,
+                        f"提示重建失败: {error}，已保存部分结果",
+                        reason="segment",
+                    )
+                    yield event
+                    return
+                yield {
+                    "type": "session_restart",
+                    "frame_index": segment_start,
+                    "segment_frames": session.segment_frame_limit,
+                    "reason": "segment",
+                }
 
-                generator = session.predictor.handle_stream_request(
-                    request=request_dict
+            while segment_start <= overall_end:
+                segment_end = (
+                    overall_end
+                    if segment_limit <= 0
+                    else min(
+                        segment_start + segment_limit - 1, overall_end
+                    )
                 )
+                orig_height, orig_width = self._get_frame_dimensions(
+                    session.frames
+                )
+                prompt_frame_relative_idx = None
+                if session.last_prompt_frame is not None:
+                    prompt_frame_relative_idx = (
+                        session.last_prompt_frame - session.start_frame_index
+                    )
 
-                for response in generator:
-                    frame_idx = response.get("frame_index")
-                    outputs = response.get("outputs")
+                rel_start = max(segment_start, overall_start) - session.start_frame_index
+                rel_end = segment_end - session.start_frame_index
+                rel_start = max(0, rel_start)
+                if rel_end < rel_start:
+                    rel_end = rel_start
 
-                    if frame_idx is None or outputs is None:
+                chunk_size = self._propagate_chunk_size
+                if session.prompt_frame_params:
+                    override = self._parse_int(
+                        session.prompt_frame_params.get(
+                            "propagate_chunk_size", 0
+                        ),
+                        0,
+                    )
+                    if override > 0:
+                        chunk_size = override
+                if chunk_size < 0:
+                    chunk_size = 0
+
+                try:
+                    chunk_start = rel_start
+                    while chunk_start <= rel_end:
+                        chunk_end = (
+                            rel_end
+                            if chunk_size <= 0
+                            else min(
+                                chunk_start + chunk_size - 1, rel_end
+                            )
+                        )
+                        request_dict = dict(
+                            type="propagate_in_video",
+                            session_id=session_id,
+                            propagation_direction="forward",
+                            start_frame_index=chunk_start,
+                            max_frame_num_to_track=max(
+                                chunk_end - chunk_start, 0
+                            ),
+                        )
+                        if chunk_size > 0:
+                            request_dict["force_propagation"] = True
+
+                        generator = session.predictor.handle_stream_request(
+                            request=request_dict
+                        )
+
+                        for response in generator:
+                            frame_idx = response.get("frame_index")
+                            outputs = response.get("outputs")
+
+                            if frame_idx is None or outputs is None:
+                                continue
+
+                            absolute_frame_idx = (
+                                frame_idx + session.start_frame_index
+                            )
+                            if (
+                                absolute_frame_idx < overall_start
+                                or absolute_frame_idx > overall_end
+                            ):
+                                continue
+
+                            frame_count += 1
+                            self._maybe_clear_cache(frame_count)
+                            session.last_output_frame = absolute_frame_idx
+                            restart_mask = outputs.get("out_binary_masks", [])
+                            if isinstance(restart_mask, np.ndarray):
+                                restart_mask = (
+                                    restart_mask[0]
+                                    if restart_mask.size > 0
+                                    else None
+                                )
+                            elif isinstance(restart_mask, (list, tuple)):
+                                restart_mask = (
+                                    restart_mask[0] if restart_mask else None
+                                )
+                            if isinstance(restart_mask, torch.Tensor):
+                                restart_mask = (
+                                    restart_mask.detach().cpu().numpy()
+                                )
+                            elif (
+                                restart_mask is not None
+                                and not isinstance(restart_mask, np.ndarray)
+                            ):
+                                restart_mask = np.array(restart_mask)
+                            session.last_restart_mask = restart_mask
+                            session.last_outputs = (
+                                {"out_binary_masks": restart_mask}
+                                if restart_mask is not None
+                                else None
+                            )
+
+                            yield {
+                                "type": "progress",
+                                "current_frame": absolute_frame_idx,
+                                "total_frames": total_frames,
+                                "progress": frame_count
+                                / max(frames_to_process, 1),
+                            }
+
+                            if (
+                                prompt_frame_relative_idx is not None
+                                and frame_idx == prompt_frame_relative_idx
+                                and session.prompt_frame_outputs is not None
+                            ):
+                                continue
+
+                            out_binary_masks = outputs.get(
+                                "out_binary_masks", []
+                            )
+                            out_probs = outputs.get("out_probs", [])
+                            out_obj_ids = self._normalize_obj_ids(
+                                outputs.get("out_obj_ids", [])
+                            )
+                            out_boxes_xywh = outputs.get("out_boxes_xywh", [])
+                            out_tracker_probs = outputs.get(
+                                "out_tracker_probs", None
+                            )
+
+                            params = self._get_inference_params(
+                                session.prompt_frame_params
+                            )
+                            self._update_suppressed_obj_ids(
+                                session,
+                                out_binary_masks,
+                                out_obj_ids,
+                                out_tracker_probs,
+                                params,
+                                orig_width,
+                                orig_height,
+                            )
+                            shapes = self._convert_outputs_to_shapes(
+                                out_binary_masks,
+                                out_probs,
+                                out_obj_ids,
+                                out_boxes_xywh,
+                                out_tracker_probs,
+                                text_prompt,
+                                params["conf_threshold"],
+                                params["tracker_conf_threshold"],
+                                params["mask_min_area_ratio"],
+                                params["mask_expand_ratio"],
+                                params["mask_union_iou"],
+                                params["mask_union_max_area_ratio"],
+                                params["use_mask_bbox"],
+                                params["show_boxes"],
+                                params["show_masks"],
+                                params["show_rotations"],
+                                params["rotation_smooth"],
+                                params["rotation_min_area"],
+                                params["rotation_max_delta"],
+                                params["rotation_lock_area_ratio"],
+                                params["epsilon_factor"],
+                                orig_width,
+                                orig_height,
+                                session.suppressed_obj_ids,
+                                session.rotation_cache,
+                                session.mask_cache,
+                            )
+
+                            results[absolute_frame_idx] = {"masks": shapes}
+
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                            if hasattr(torch.cuda, "ipc_collect"):
+                                torch.cuda.ipc_collect()
+
+                        if chunk_end >= rel_end:
+                            break
+                        chunk_start = chunk_end + 1
+
+                except Exception as e:
+                    if self._is_oom_error(e):
+                        self._append_prompt_outputs(
+                            session,
+                            results,
+                            orig_width,
+                            orig_height,
+                            text_prompt,
+                        )
+                        restart_at = (
+                            session.last_output_frame + 1
+                            if session.last_output_frame is not None
+                            else segment_start
+                        )
+                        if restart_at > overall_end:
+                            break
+                        remaining = max(overall_end - restart_at + 1, 0)
+                        previous_limit = session.segment_frame_limit
+                        if not self._maybe_reduce_segment_limit(
+                            session, remaining
+                        ):
+                            event = self._build_partial_completion(
+                                results,
+                                "前向推理显存不足，已保存部分结果",
+                                reason="oom",
+                            )
+                            yield event
+                            return
+                        error = self._restart_session_for_segment(
+                            session, restart_at
+                        )
+                        if error:
+                            event = self._build_partial_completion(
+                                results,
+                                f"会话重建失败: {error}，已保存部分结果",
+                                reason="oom",
+                            )
+                            yield event
+                            return
+                        error = self._reapply_prompt_for_segment(
+                            session, restart_at
+                        )
+                        if error:
+                            event = self._build_partial_completion(
+                                results,
+                                f"提示重建失败: {error}，已保存部分结果",
+                                reason="oom",
+                            )
+                            yield event
+                            return
+                        if previous_limit != session.segment_frame_limit:
+                            logger.warning(
+                                "前向推理显存不足，分段帧数从 %d 缩短到 %d，重启于帧 %d",
+                                previous_limit,
+                                session.segment_frame_limit,
+                                restart_at,
+                            )
+                        segment_limit = session.segment_frame_limit
+                        segment_start = restart_at
+                        yield {
+                            "type": "session_restart",
+                            "frame_index": restart_at,
+                            "segment_frames": segment_limit,
+                            "reason": "oom",
+                        }
                         continue
+                    raise
 
-                    frame_count += 1
-                    self._maybe_clear_cache(frame_count)
-                    absolute_frame_idx = frame_idx + start_frame_offset
+                self._append_prompt_outputs(
+                    session, results, orig_width, orig_height, text_prompt
+                )
 
-                    yield {
-                        "type": "progress",
-                        "current_frame": absolute_frame_idx,
-                        "total_frames": total_frames,
-                        "progress": frame_count / max(total_frames, 1),
-                    }
-
-                    if (
-                        prompt_frame_relative_idx is not None
-                        and frame_idx == prompt_frame_relative_idx
-                        and session.prompt_frame_outputs is not None
-                    ):
-                        continue
-
-                    out_binary_masks = outputs.get("out_binary_masks", [])
-                    out_probs = outputs.get("out_probs", [])
-                    out_obj_ids = self._normalize_obj_ids(
-                        outputs.get("out_obj_ids", [])
-                    )
-                    out_boxes_xywh = outputs.get("out_boxes_xywh", [])
-                    out_tracker_probs = outputs.get("out_tracker_probs", None)
-
-                    params = self._get_inference_params(
-                        session.prompt_frame_params
-                    )
-                    self._update_suppressed_obj_ids(
-                        session,
-                        out_binary_masks,
-                        out_obj_ids,
-                        out_tracker_probs,
-                        params,
-                        orig_width,
-                        orig_height,
-                    )
-                    shapes = self._convert_outputs_to_shapes(
-                        out_binary_masks,
-                        out_probs,
-                        out_obj_ids,
-                        out_boxes_xywh,
-                        out_tracker_probs,
-                        text_prompt,
-                        params["conf_threshold"],
-                        params["tracker_conf_threshold"],
-                        params["mask_min_area_ratio"],
-                        params["mask_expand_ratio"],
-                        params["mask_union_iou"],
-                        params["mask_union_max_area_ratio"],
-                        params["use_mask_bbox"],
-                        params["show_boxes"],
-                        params["show_masks"],
-                        params["show_rotations"],
-                        params["rotation_smooth"],
-                        params["rotation_min_area"],
-                        params["rotation_max_delta"],
-                        params["rotation_lock_area_ratio"],
-                        params["epsilon_factor"],
-                        orig_width,
-                        orig_height,
-                        session.suppressed_obj_ids,
-                        session.rotation_cache,
-                        session.mask_cache,
-                    )
-
-                    results[absolute_frame_idx] = {"masks": shapes}
-
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                    if hasattr(torch.cuda, "ipc_collect"):
-                        torch.cuda.ipc_collect()
-
-                if chunk_end >= end_idx:
+                if segment_end >= overall_end:
                     break
-                chunk_start = chunk_end + 1
+                if segment_limit <= 0:
+                    break
 
-            if (
-                session.prompt_frame_outputs is not None
-                and prompt_absolute_idx is not None
-            ):
-                prompt_outputs = session.prompt_frame_outputs
-                prompt_obj_ids = self._normalize_obj_ids(
-                    prompt_outputs.get("out_obj_ids", [])
+                segment_start = segment_end + 1
+                error = self._restart_session_for_segment(
+                    session, segment_start
                 )
-
-                params = self._get_inference_params(
-                    session.prompt_frame_params
+                if error:
+                    event = self._build_partial_completion(
+                        results,
+                        f"会话重建失败: {error}，已保存部分结果",
+                        reason="segment",
+                    )
+                    yield event
+                    return
+                error = self._reapply_prompt_for_segment(
+                    session, segment_start
                 )
-                prompt_shapes = self._convert_outputs_to_shapes(
-                    prompt_outputs.get("out_binary_masks", []),
-                    prompt_outputs.get("out_probs", []),
-                    prompt_obj_ids,
-                    prompt_outputs.get("out_boxes_xywh", []),
-                    prompt_outputs.get("out_tracker_probs", None),
-                    text_prompt,
-                    params["conf_threshold"],
-                    params["tracker_conf_threshold"],
-                    params["mask_min_area_ratio"],
-                    params["mask_expand_ratio"],
-                    params["mask_union_iou"],
-                    params["mask_union_max_area_ratio"],
-                    params["use_mask_bbox"],
-                    params["show_boxes"],
-                    params["show_masks"],
-                    params["show_rotations"],
-                    params["rotation_smooth"],
-                    params["rotation_min_area"],
-                    params["rotation_max_delta"],
-                    params["rotation_lock_area_ratio"],
-                    params["epsilon_factor"],
-                    orig_width,
-                    orig_height,
-                    session.suppressed_obj_ids,
-                    session.rotation_cache,
-                    session.mask_cache,
-                )
-                results[prompt_absolute_idx] = {"masks": prompt_shapes}
+                if error:
+                    event = self._build_partial_completion(
+                        results,
+                        f"提示重建失败: {error}，已保存部分结果",
+                        reason="segment",
+                    )
+                    yield event
+                    return
+                segment_limit = session.segment_frame_limit
+                yield {
+                    "type": "session_restart",
+                    "frame_index": segment_start,
+                    "segment_frames": segment_limit,
+                    "reason": "segment",
+                }
 
             yield {
                 "type": "completed",
@@ -1110,7 +1489,10 @@ class SegmentAnything3Video(BaseModel):
             logger.opt(exception=True).error(
                 f"Stream propagation error: {e}"
             )
-            yield {"type": "error", "message": str(e)}
+            event = self._build_partial_completion(
+                results, f"前向推理异常中断: {e}", reason="error"
+            )
+            yield event
         finally:
             if bf16_context is not None:
                 try:
@@ -1591,6 +1973,259 @@ class SegmentAnything3Video(BaseModel):
             if hasattr(torch.cuda, "ipc_collect"):
                 torch.cuda.ipc_collect()
 
+    def _normalize_image_size(self, value: Any) -> int:
+        image_size = self._parse_int(value, 1008)
+        if image_size <= 0:
+            image_size = 1008
+        if image_size not in self._allowed_image_sizes:
+            logger.warning(
+                f"Unsupported image_size {image_size}, fallback to 1008"
+            )
+            image_size = 1008
+        return image_size
+
+    @staticmethod
+    def _is_oom_error(exc: Exception) -> bool:
+        if isinstance(exc, torch.cuda.OutOfMemoryError):
+            return True
+        message = str(exc).lower()
+        return "out of memory" in message or (
+            "cuda" in message and "memory" in message
+        )
+
+    @staticmethod
+    def _slice_frames(
+        frames: List[np.ndarray], start_index: int, limit: int
+    ) -> List[np.ndarray]:
+        if not frames:
+            return []
+        start_index = max(int(start_index), 0)
+        if start_index >= len(frames):
+            return []
+        if limit <= 0:
+            return frames[start_index:]
+        end_index = min(start_index + limit, len(frames))
+        return frames[start_index:end_index]
+
+    def _reset_session_runtime(self, session: _VideoSession) -> None:
+        session.rotation_cache.clear()
+        session.low_conf_frames.clear()
+        session.suppressed_obj_ids.clear()
+        session.mask_cache.clear()
+        session.prompt_frame_outputs = None
+        session.last_output_frame = None
+        session.last_outputs = None
+        session.last_restart_mask = None
+
+    def _ensure_prompt_frame(
+        self, session: _VideoSession, frame_index: int
+    ) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+        full_frames = (
+            session.full_frames if session.full_frames else session.frames
+        )
+        total_frames = len(full_frames)
+        if frame_index < 0 or frame_index >= total_frames:
+            return f"Frame index {frame_index} out of range", None
+        if (
+            frame_index < session.start_frame_index
+            or frame_index >= session.start_frame_index + len(session.frames)
+        ):
+            if session.segment_frame_limit <= 0:
+                return f"Frame index {frame_index} out of range", None
+            error = self._restart_session_for_segment(session, frame_index)
+            if error:
+                return error, None
+            return None, {
+                "frame_index": frame_index,
+                "segment_frames": session.segment_frame_limit,
+                "reason": "segment",
+            }
+        return None, None
+
+    def _restart_session_for_segment(
+        self, session: _VideoSession, start_frame_index: int
+    ) -> Optional[str]:
+        segment_frames = self._slice_frames(
+            session.full_frames, start_frame_index, session.segment_frame_limit
+        )
+        if not segment_frames:
+            return "No frames available for session restart"
+
+        try:
+            session.cleanup()
+        except Exception as e:
+            logger.warning(f"Session cleanup error before restart: {e}")
+
+        session.frames = segment_frames
+        session.start_frame_index = start_frame_index
+        session.segment_index += 1
+        session.created_at = time.time()
+        self._reset_session_runtime(session)
+        session._init_predictor_session()
+        return None
+
+    def _maybe_reduce_segment_limit(
+        self, session: _VideoSession, remaining_frames: int
+    ) -> bool:
+        if session.segment_frame_limit <= 0:
+            session.segment_frame_limit = max(1, min(30, remaining_frames))
+            session.segment_frame_limit_max = (
+                session.segment_frame_limit_max
+                if session.segment_frame_limit_max > 0
+                else session.segment_frame_limit
+            )
+            return True
+        if session.segment_frame_limit <= 1:
+            return False
+        session.segment_frame_limit = max(1, session.segment_frame_limit // 2)
+        return True
+
+    @staticmethod
+    def _mask_to_point(mask: np.ndarray) -> Optional[List[float]]:
+        if mask is None:
+            return None
+        mask_np = mask
+        if isinstance(mask_np, torch.Tensor):
+            mask_np = mask_np.detach().cpu().numpy()
+        if not isinstance(mask_np, np.ndarray):
+            mask_np = np.array(mask_np)
+        if mask_np.size == 0:
+            return None
+        coords = np.argwhere(mask_np > 0.5)
+        if coords.size == 0:
+            return None
+        y_mean, x_mean = coords.mean(axis=0)
+        height, width = mask_np.shape[-2], mask_np.shape[-1]
+        if height <= 0 or width <= 0:
+            return None
+        return [float(x_mean) / float(width), float(y_mean) / float(height)]
+
+    def _build_restart_points(self, session: _VideoSession) -> Optional[Dict[str, Any]]:
+        if session.last_restart_mask is not None:
+            point = self._mask_to_point(session.last_restart_mask)
+            if point:
+                return {
+                    "points": [point],
+                    "point_labels": [1],
+                    "obj_id": session.prompt_obj_id,
+                }
+        if session.last_outputs and isinstance(session.last_outputs, dict):
+            masks = session.last_outputs.get("out_binary_masks", [])
+            if isinstance(masks, np.ndarray) and masks.size > 0:
+                mask = masks[0]
+            elif isinstance(masks, (list, tuple)) and len(masks) > 0:
+                mask = masks[0]
+            else:
+                mask = None
+            point = self._mask_to_point(mask)
+            if point:
+                return {
+                    "points": [point],
+                    "point_labels": [1],
+                    "obj_id": session.prompt_obj_id,
+                }
+        if session.prompt_points and session.prompt_point_labels:
+            return {
+                "points": session.prompt_points,
+                "point_labels": session.prompt_point_labels,
+                "obj_id": session.prompt_obj_id,
+            }
+        return None
+
+    def _reapply_prompt_for_segment(
+        self, session: _VideoSession, prompt_frame_index: int
+    ) -> Optional[str]:
+        params = session.prompt_frame_params or {}
+        if session.text_prompt:
+            result = self.add_prompt(
+                session.session_id,
+                session.text_prompt,
+                prompt_frame_index,
+                params,
+            )
+        else:
+            prompt_data = self._build_restart_points(session)
+            if not prompt_data:
+                return "No prompt data available for session restart"
+            result = self.add_point_prompt(
+                session.session_id,
+                prompt_data["points"],
+                prompt_data["point_labels"],
+                prompt_data.get("obj_id"),
+                prompt_frame_index,
+                params,
+            )
+        if "error" in result:
+            return result["error"]
+        return None
+
+    def _append_prompt_outputs(
+        self,
+        session: _VideoSession,
+        results: Dict[int, Dict[str, Any]],
+        orig_width: int,
+        orig_height: int,
+        text_prompt: str,
+    ) -> None:
+        if session.prompt_frame_outputs is None:
+            return
+        if session.last_prompt_frame is None:
+            return
+        if session.last_prompt_frame in results:
+            return
+        prompt_outputs = session.prompt_frame_outputs
+        prompt_obj_ids = self._normalize_obj_ids(
+            prompt_outputs.get("out_obj_ids", [])
+        )
+        params = self._get_inference_params(session.prompt_frame_params)
+        prompt_shapes = self._convert_outputs_to_shapes(
+            prompt_outputs.get("out_binary_masks", []),
+            prompt_outputs.get("out_probs", []),
+            prompt_obj_ids,
+            prompt_outputs.get("out_boxes_xywh", []),
+            prompt_outputs.get("out_tracker_probs", None),
+            text_prompt,
+            params["conf_threshold"],
+            params["tracker_conf_threshold"],
+            params["mask_min_area_ratio"],
+            params["mask_expand_ratio"],
+            params["mask_union_iou"],
+            params["mask_union_max_area_ratio"],
+            params["use_mask_bbox"],
+            params["show_boxes"],
+            params["show_masks"],
+            params["show_rotations"],
+            params["rotation_smooth"],
+            params["rotation_min_area"],
+            params["rotation_max_delta"],
+            params["rotation_lock_area_ratio"],
+            params["epsilon_factor"],
+            orig_width,
+            orig_height,
+            session.suppressed_obj_ids,
+            session.rotation_cache,
+            session.mask_cache,
+        )
+        results[session.last_prompt_frame] = {"masks": prompt_shapes}
+
+
+    @staticmethod
+    def _build_partial_completion(
+        results: Dict[int, Dict[str, Any]],
+        message: str,
+        reason: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        if not results:
+            return {"type": "error", "message": message}
+        event = {
+            "type": "completed",
+            "results": results,
+            "partial": True,
+            "message": message,
+        }
+        if reason:
+            event["reason"] = reason
+        return event
 
     def _normalize_obj_ids(self, obj_ids: Any) -> np.ndarray:
         """Normalize object IDs to numpy array.

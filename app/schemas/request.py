@@ -16,6 +16,9 @@ class VideoInitRequest(BaseModel):
     model: str
     frames: List[str]
     start_frame_index: int = 0
+    params: Dict[str, Any] = {}
+    image_size: Optional[int] = None
+    session_frame_limit: Optional[int] = None
 
 
 class VideoPromptRequest(BaseModel):

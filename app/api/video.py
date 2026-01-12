@@ -36,6 +36,17 @@ async def init_video_session(request: VideoInitRequest):
     model_id = request.model
     frames_data = request.frames
     start_frame_index = request.start_frame_index
+    params = request.params or {}
+    image_size = (
+        request.image_size
+        if request.image_size is not None
+        else params.get("image_size")
+    )
+    session_frame_limit = (
+        request.session_frame_limit
+        if request.session_frame_limit is not None
+        else params.get("session_frame_limit", params.get("session_frame_length"))
+    )
 
     if not model_id:
         return ErrorResponse(
@@ -83,7 +94,12 @@ async def init_video_session(request: VideoInitRequest):
                 )
             frames.append(frame)
 
-        result = model.init_session(frames, start_frame_index)
+        result = model.init_session(
+            frames,
+            start_frame_index,
+            image_size=image_size,
+            session_frame_limit=session_frame_limit,
+        )
 
         if "error" in result:
             return ErrorResponse(

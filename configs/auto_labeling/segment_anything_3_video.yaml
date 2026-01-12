@@ -28,7 +28,8 @@ params:
   rotation_max_delta: 30
   rotation_lock_area_ratio: 1.2
   epsilon_factor: 0.001
-  image_size: 768
+  image_size: 1008
+  session_frame_limit: 0
   propagate_chunk_size: 20
   offload_video_to_cpu: true
   offload_state_to_cpu: true
@@ -50,6 +51,14 @@ widgets:
     value: null
   - name: button_send
     value: null
+  - name: image_size_label
+    value: null
+  - name: image_size_select_combobox
+    value: 1008
+  - name: session_frame_length_label
+    value: null
+  - name: session_frame_length_spinbox
+    value: 0
   - name: input_conf
     value: null
   - name: edit_conf
